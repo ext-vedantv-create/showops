@@ -282,3 +282,6 @@ label.chk.toggle { min-height: 38px; padding: 0 6px; white-space: nowrap; font-s
 .group h3 { display: flex; align-items: center; gap: 8px; font-size: 15px; margin: 6px 0 8px; }
 .group h3 .av { width: 26px; height: 26px; font-size: 11px; }
 .group h3 small { color: var(--muted); font-weight: 500; }
+.alert-sum { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 12px; }
+@media (max-width: 600px) { .alert-sum { grid-template-columns: 1fr; } }
+.brand { white-space: nowrap; }

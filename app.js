@@ -6,7 +6,8 @@
   "use strict";
 
   const CFG = window.SHOWOPS_CONFIG || {};
-  const APP = CFG.APP_NAME || "ShowOps";
+  const APP = CFG.APP_NAME && CFG.APP_NAME !== "ShowOps" ? CFG.APP_NAME : "ShowOps - DE";
+  document.title = APP;
   const $ = (sel, el = document) => el.querySelector(sel);
   const $$ = (sel, el = document) => Array.from(el.querySelectorAll(sel));
   const root = $("#app");
@@ -44,7 +45,6 @@
   };
 
   const PAGES = [
-    ["dashboard", "Dashboard", "⌂"],
     ["shows", "Shows Master", "▣"],
     ["production", "Production Tracker", "▦"],
     ["maq", "MAQ Alerts", "⏱"],
@@ -56,6 +56,7 @@
     ["team", "Team & Settings", "⚙"],
   ];
   const HIDDEN_PAGES = ["show"];
+  const landing = () => (role() === "writer" ? "mytasks" : "tracker");   // first page after sign-in
   const STATUSES = ["Unassigned", "Assigned", "In Progress", "Blocked", "Completed", "Cancelled"];
   const TASK_TYPES = ["L/S", "Adaptation", "AIVO", "Translation", "Summary", "QC", "Other"];
   const WAITING_ON = ["Ops", "Writer", "Rectifier", "Producer", "Sound Engineer", "Proofreader"];
@@ -460,6 +461,10 @@
     for (const i of openIssues().filter((i) => i.severity === "Critical")) items.push({ kind: "Critical blocker", cls: "bad", text: `${showName(i.show_id)}: ${i.description}`, href: "#blockers" });
     return items;
   }
+  function batchCounts() {
+    const c = (st) => S.batches.reduce((n, b) => n + (b.loc_status === st) + (b.adapted_status === st), 0);
+    return { writer: c("Pending (Writer)"), ops: c("Pending (Ops)") };
+  }
   const bellBtn = () => { const n = alertItems().length; return `<button type="button" id="bell" class="bell ${n ? "hot" : ""}" title="Alerts">🔔${n ? `<span>${n}</span>` : ""}</button>`; };
 
   function header(title, sub, right = "") {
@@ -469,12 +474,13 @@
   const PAGE_FN = {};
   function route() {
     if (!S.me || !$("#main")) return;
-    const raw = (location.hash || "#dashboard").slice(1);
+    const raw = (location.hash || "#").slice(1);
     let [id, param] = raw.split("/");
     if (id === "workload") id = "tracker";                                   // merged into Task Tracker
     if (id === "status") { id = "shows"; S.f.shows.sort = "activity"; }      // merged into Shows Master
-    if (![...PAGES.map((p) => p[0]), ...HIDDEN_PAGES].includes(id) || (id === "team" && !isManager())) id = "dashboard";
-    if (!S.v2 && ["production", "maq", "show"].includes(id)) id = "dashboard";
+    if (![...PAGES.map((p) => p[0]), ...HIDDEN_PAGES].includes(id) || (id === "team" && !isManager())) id = landing();
+    if (!S.v2 && ["production", "maq", "show"].includes(id)) id = landing();
+    if (id === "production" && ["writer", "ops", "await", "pending"].includes(param)) { S.f.production.only = param; param = null; }
     S.page = id;
     S.param = param ? decodeURIComponent(param) : null;
     S.redraw = null;
@@ -1267,8 +1273,12 @@
   // ---------- 10. Pop-up forms ----------
   function alertsModal() {
     const items = alertItems();
-    openModal(`Alerts (${items.length})`, items.length ? `<div class="alerts">${items.map((a) => `<a href="${a.href}" class="alert-row" data-close>${pill(a.kind, a.cls)}<span>${esc(a.text)}</span></a>`).join("")}</div>
-      <p class="hint">${isStaff() ? "You see every delayed task in the team." : "You see delayed tasks assigned to you."} Delay rules are set in Team &amp; Settings.</p>` : `<div class="empty">Nothing needs attention right now. 🎉</div>`);
+    const bc = batchCounts();
+    const summary = `<div class="alert-sum">
+      <a href="#production/writer" data-close class="alert-row">${pill("Batches", "warn")}<span><b>${bc.writer}</b> LOC sheet / adapted script batch(es) pending from <b>Writer</b></span></a>
+      <a href="#production/ops" data-close class="alert-row">${pill("Batches", "accent")}<span><b>${bc.ops}</b> LOC sheet / adapted script batch(es) pending from <b>Ops</b></span></a></div>`;
+    openModal(`Alerts (${items.length})`, summary + (items.length ? `<div class="alerts">${items.map((a) => `<a href="${a.href}" class="alert-row" data-close>${pill(a.kind, a.cls)}<span>${esc(a.text)}</span></a>`).join("")}</div>
+      <p class="hint">${isStaff() ? "You see every delayed task in the team." : "You see delayed tasks assigned to you."} Delay rules are set in Team &amp; Settings.</p>` : `<div class="empty">No delayed tasks, MAQ alerts or critical blockers right now. 🎉</div>`));
   }
 
   function taskModal(t) {
