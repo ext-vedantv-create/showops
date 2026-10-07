@@ -285,3 +285,23 @@ label.chk.toggle { min-height: 38px; padding: 0 6px; white-space: nowrap; font-s
 .alert-sum { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 12px; }
 @media (max-width: 600px) { .alert-sum { grid-template-columns: 1fr; } }
 .brand { white-space: nowrap; }
+
+/* v2.3: progress colour bands */
+.prog { --pc: var(--good); --pt: var(--good); }
+.prog.p-red    { --pc: #e5484d; --pt: #c0283b; }
+.prog.p-orange { --pc: #f2780c; --pt: #b25300; }
+.prog.p-yellow { --pc: #f2c400; --pt: #8a6d00; }
+.prog.p-green  { --pc: #22a45d; --pt: #137a43; }
+.prog .pbar span { background: var(--pc); }
+.prog b { display: block; font-size: 13px; color: var(--pt); line-height: 1.3; }
+.prog small { display: block; color: var(--muted); font-size: 12px; }
+
+/* export menu */
+.menu-wrap { position: relative; }
+.menu { position: absolute; right: 0; top: calc(100% + 6px); background: #fff; border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.14); min-width: 210px; padding: 6px; z-index: 20; }
+.menu button { display: block; width: 100%; text-align: left; border: 0; background: none; padding: 9px 12px; border-radius: 7px; cursor: pointer; font-weight: 600; }
+.menu button:hover { background: var(--accent-soft); color: var(--accent); }
+.menu-note { margin: 4px 12px 6px; font-size: 12px; color: var(--muted); }
+input.inline.tid { width: 92px; font-variant-numeric: tabular-nums; }
+input.inline.tid:placeholder-shown { border-style: dashed; }
+td select[data-act="assign-row"] { min-width: 150px; }

@@ -60,7 +60,7 @@
   const STATUSES = ["Unassigned", "Assigned", "In Progress", "Blocked", "Completed", "Cancelled"];
   const TASK_TYPES = ["L/S", "Adaptation", "AIVO", "Translation", "Summary", "QC", "Other"];
   const WAITING_ON = ["Ops", "Writer", "Rectifier", "Producer", "Sound Engineer", "Proofreader"];
-  const BATCH_STATUSES = ["Not started", "Pending (Writer)", "Pending (Ops)", "Await", "Batch pending", "Done", "NA", "Early closure"];
+  const BATCH_STATUSES = ["Not started", "Pending (Writer)", "Pending (Ops)", "Batch pending", "Done", "NA", "Early closure"];   // "Await" = Pending (Writer)
   const PROD_STAGES = ["Yet to pick", "Step 1: SS + LOC received", "Step 2: LS V3 vetted", "Step 3: Adapted script vetted", "Step 4: Audio QC",
     "Step 5: Rectify / Re-Gen", "Step 6: SE patchwork", "Step 7: GTG from production", "Launched", "Unpublished", "Not to be picked", "Show Dropped", "On Hold"];
   const SOURCE_STATES = ["Running", "Completed", "Hiatus", "NA"];
@@ -155,13 +155,14 @@
   const COMPLETE = ["Done", "NA", "Early closure"];
   function progressOf(s) {
     const bs = batchesFor(s.id);
-    const total = s.source_eps ? Math.max(Math.ceil(s.source_eps / 100), bs.length) : bs.length;
+    // No batches recorded = this show isn't tracked batch-by-batch (e.g. audio-gen-only); don't show it as 0%.
+    const total = !bs.length ? 0 : s.source_eps ? Math.max(Math.ceil(s.source_eps / 100), bs.length) : bs.length;
     const loc = bs.filter((b) => COMPLETE.includes(b.loc_status)).length;
     const adp = bs.filter((b) => COMPLETE.includes(b.adapted_status)).length;
     const cnt = (st) => bs.reduce((n, b) => n + (b.loc_status === st) + (b.adapted_status === st), 0);
     return {
       total, loc, adp, pct: total ? Math.min(1, adp / total) : null,
-      writer: cnt("Pending (Writer)"), ops: cnt("Pending (Ops)"), await: cnt("Await"), batchPending: cnt("Batch pending"),
+      writer: cnt("Pending (Writer)") + cnt("Await"), ops: cnt("Pending (Ops)"), batchPending: cnt("Batch pending"),
     };
   }
 
@@ -197,16 +198,21 @@
     const cls = st === "Launched" ? "good" : /Dropped|Not to be/.test(st) ? "" : /^Step/.test(st) ? "accent" : st === "Unpublished" || st === "On Hold" ? "warn" : "info";
     return pill(st.replace(/ from production$/, ""), cls);
   };
-  const BCLS = { "Not started": "b-none", "Pending (Writer)": "b-writer", "Pending (Ops)": "b-ops", Await: "b-await", "Batch pending": "b-bp", Done: "b-done", NA: "b-na", "Early closure": "b-early" };
-  const batchPill = (s) => `<span class="bpill ${BCLS[s] || ""}">${esc(s)}</span>`;
+  const BCLS = { "Not started": "b-none", "Pending (Writer)": "b-writer", "Pending (Ops)": "b-ops", Await: "b-writer", "Batch pending": "b-bp", Done: "b-done", NA: "b-na", "Early closure": "b-early" };
+  const batchPill = (s) => { if (s === "Await") s = "Pending (Writer)"; return `<span class="bpill ${BCLS[s] || ""}">${esc(s)}</span>`; };
   const highCell = (t) => (t.high_flag ? `<span class="flag">● Yes</span>` : `<span class="dim">—</span>`);
   function deadlineCell(t) {
     const d = delay(t);
     const base = t.deadline ? `<span class="${isOverdue(t) ? "late" : ""}">${fmtDate(t.deadline)}</span>` : `<span class="dim">—</span>`;
     return d.late ? `${base}<small class="late">⚠ ${d.days} day${d.days === 1 ? "" : "s"} late</small>` : base;
   }
-  const progressBar = (p) => (p.pct == null ? `<span class="dim">—</span>`
-    : `<div class="pbar" title="${p.adp}/${p.total} adapted batches done"><span style="width:${Math.round(p.pct * 100)}%"></span></div><small>${Math.round(p.pct * 100)}% · ${p.adp}/${p.total}</small>`);
+  // Progress colours: 0–24 red, 25–49 orange, 50–74 yellow, 75–100 green
+  const progCls = (pct) => (pct < 25 ? "p-red" : pct < 50 ? "p-orange" : pct < 75 ? "p-yellow" : "p-green");
+  const progressBar = (p) => {
+    if (p.pct == null) return `<span class="dim" title="No LOC / adapted batches recorded for this show">Not tracked</span>`;
+    const pct = Math.round(p.pct * 100);
+    return `<div class="prog ${progCls(pct)}" title="${p.adp} of ${p.total} adapted-script batches done"><div class="pbar"><span style="width:${Math.max(pct, 2)}%"></span></div><b>${pct}%</b><small>${p.adp}/${p.total}</small></div>`;
+  };
 
   const PR = { P0: 0, P1: 1, P2: 2 }, HR = { High: 0, Medium: 1, Low: 2 };
   const prioritySort = (a, b) =>
@@ -246,6 +252,68 @@
     await loadAll();
     refresh();
     return true;
+  }
+
+  // ---------- 2b. Export to CSV / Excel (no extra libraries) ----------
+  function downloadBlob(blob, name) {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.append(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }
+  function toCSV(rows) {
+    const cell = (v) => { const s = v == null ? "" : String(v); return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+    return "\ufeff" + rows.map((r) => r.map(cell).join(",")).join("\r\n");   // BOM so Excel shows ä/ö/ü correctly
+  }
+  // Minimal .xlsx writer: one sheet, text + numbers, bold header, frozen first row.
+  const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+  const crc32 = (b) => { let c = 0xffffffff; for (let i = 0; i < b.length; i++) c = CRC_T[(c ^ b[i]) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+  function zip(files) {                       // files: [{name, data(Uint8Array)}], stored (no compression)
+    const enc = new TextEncoder(); const parts = []; const central = []; let offset = 0;
+    for (const f of files) {
+      const nm = enc.encode(f.name), crc = crc32(f.data), sz = f.data.length;
+      const h = new DataView(new ArrayBuffer(30));
+      h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(8, 0, true);
+      h.setUint32(14, crc, true); h.setUint32(18, sz, true); h.setUint32(22, sz, true); h.setUint16(26, nm.length, true);
+      parts.push(new Uint8Array(h.buffer), nm, f.data);
+      const c = new DataView(new ArrayBuffer(46));
+      c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true);
+      c.setUint32(16, crc, true); c.setUint32(20, sz, true); c.setUint32(24, sz, true); c.setUint16(28, nm.length, true); c.setUint32(42, offset, true);
+      central.push(new Uint8Array(c.buffer), nm);
+      offset += 30 + nm.length + sz;
+    }
+    const cs = central.reduce((n, a) => n + a.length, 0);
+    const e = new DataView(new ArrayBuffer(22));
+    e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true); e.setUint32(12, cs, true); e.setUint32(16, offset, true);
+    return new Blob([...parts, ...central, new Uint8Array(e.buffer)], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  }
+  function toXLSX(rows, sheetName = "Tasks") {
+    const x = (v) => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "");
+    const col = (i) => { let s = ""; i++; while (i) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; };
+    const sheet = rows.map((r, ri) => `<row r="${ri + 1}">${r.map((v, ci) => {
+      const ref = col(ci) + (ri + 1), st = ri === 0 ? ' s="1"' : "";
+      if (v == null || v === "") return "";
+      if (typeof v === "number" && isFinite(v)) return `<c r="${ref}"${st}><v>${v}</v></c>`;
+      return `<c r="${ref}" t="inlineStr"${st}><is><t xml:space="preserve">${x(v)}</t></is></c>`;
+    }).join("")}</row>`).join("");
+    const widths = rows[0].map((_, ci) => Math.min(60, Math.max(8, ...rows.slice(0, 200).map((r) => String(r[ci] ?? "").length + 2))));
+    const enc = new TextEncoder();
+    const f = (name, xml) => ({ name, data: enc.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' + xml) });
+    return zip([
+      f("[Content_Types].xml", '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>'),
+      f("_rels/.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'),
+      f("xl/workbook.xml", `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="${x(sheetName).slice(0, 31)}" sheetId="1" r:id="rId1"/></sheets></workbook>`),
+      f("xl/_rels/workbook.xml.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>'),
+      f("xl/styles.xml", '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFECEAFD"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>'),
+      f("xl/worksheets/sheet1.xml", `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>${widths.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join("")}</cols><sheetData>${sheet}</sheetData><autoFilter ref="A1:${col(rows[0].length - 1)}${rows.length}"/></worksheet>`),
+    ]);
+  }
+  function taskExportRows(list) {
+    const head = ["Task ID", "Show", "Task", "Type", "Episode range", "Assigned to", "Status", "Waiting on", "H/M/L", "P level", "High flag", "Deadline", "Days delayed", "Raised by", "Created", "Updated", "Completed", "Details"];
+    const d = (ts) => (ts ? fmtDT(ts) : "");
+    return [head, ...list.map((t) => { const dl = delay(t); return [
+      t.ext_task_id || "", showName(t.show_id), t.title, t.task_type || "", t.ep_range || "", t.assigned_to ? nameOf(t.assigned_to) : (t.poc_name ? `${t.poc_name} (not in ShowOps yet)` : ""), t.status, t.waiting_on || "",
+      t.hml, t.p_level, t.high_flag ? "Yes" : "No", t.deadline ? fmtDate(t.deadline) : "", dl.late ? dl.days : "", t.raised_by ? nameOf(t.raised_by) : "", d(t.created_at), d(t.updated_at), d(t.completed_at), t.details || ""]; })];
   }
 
   // ---------- 3. Modal ----------
@@ -463,7 +531,7 @@
   }
   function batchCounts() {
     const c = (st) => S.batches.reduce((n, b) => n + (b.loc_status === st) + (b.adapted_status === st), 0);
-    return { writer: c("Pending (Writer)"), ops: c("Pending (Ops)") };
+    return { writer: c("Pending (Writer)") + c("Await"), ops: c("Pending (Ops)") };
   }
   const bellBtn = () => { const n = alertItems().length; return `<button type="button" id="bell" class="bell ${n ? "hot" : ""}" title="Alerts">🔔${n ? `<span>${n}</span>` : ""}</button>`; };
 
@@ -544,11 +612,15 @@
     const people = members();
     const shown = opt.limit ? tasks.slice(0, opt.limit) : tasks;
     const rows = shown.map((t) => {
-      const meta = [t.ext_task_id ? `#${esc(t.ext_task_id)}` : "", t.ep_range ? `EP ${esc(t.ep_range)}` : "", t.waiting_on ? `<b class="wait">waiting on ${esc(t.waiting_on)}</b>` : ""].filter(Boolean).join(" · ");
+      const meta = [t.ep_range ? `EP ${esc(t.ep_range)}` : "", t.waiting_on ? `<b class="wait">waiting on ${esc(t.waiting_on)}</b>` : ""].filter(Boolean).join(" · ");
+      const idCell = canEditTask(t)
+        ? `<input type="text" class="inline tid" data-act="ext-id" data-id="${t.id}" value="${esc(t.ext_task_id || "")}" placeholder="Add ID" aria-label="Task ID for ${esc(t.title)}" inputmode="numeric">`
+        : (t.ext_task_id ? esc(t.ext_task_id) : '<span class="dim">—</span>');
       return `<tr class="${isDelayed(t) ? "row-late" : ""}">
       ${selectable ? `<td><input class="check" type="checkbox" data-sel="${t.id}" ${S.selected.has(t.id) ? "checked" : ""} aria-label="Select task"></td>` : ""}
       ${opt.hideShow ? "" : `<td>${showLink(t.show_id)}</td>`}
       <td><b>${esc(t.title)}</b>${meta ? `<small>${meta}</small>` : ""}${t.details && !opt.compact ? `<small>${esc(t.details.slice(0, 90))}${t.details.length > 90 ? "…" : ""}</small>` : ""}</td>
+      <td>${idCell}</td>
       <td>${pill(t.task_type || "Other", "type")}</td>
       ${opt.compact ? "" : `<td>${hmlPill(t.hml)}</td><td>${pPill(t.p_level)}</td><td>${highCell(t)}</td>`}
       ${opt.hidePerson ? "" : `<td>${opt.inlineAssign && isStaff()
@@ -561,7 +633,7 @@
     }).join("");
     return `<div class="table-wrap"><table><thead><tr>
       ${selectable ? `<th><input class="check" type="checkbox" data-selall aria-label="Select all"></th>` : ""}
-      ${opt.hideShow ? "" : "<th>Show</th>"}<th>Task</th><th>Type</th>${opt.compact ? "" : "<th>H/M/L</th><th>P</th><th>High</th>"}
+      ${opt.hideShow ? "" : "<th>Show</th>"}<th>Task</th><th>Task Id</th><th>Type</th>${opt.compact ? "" : "<th>H/M/L</th><th>P</th><th>High</th>"}
       ${opt.hidePerson ? "" : "<th>Assigned to</th>"}<th>Status</th><th>Deadline</th><th>Action</th>
     </tr></thead><tbody>${rows}</tbody></table></div>
     ${opt.limit && tasks.length > opt.limit ? `<p class="hint">Showing ${opt.limit} of ${tasks.length}. Use the filters to narrow down.</p>` : ""}
@@ -631,6 +703,9 @@
     } else if (el.hasAttribute("data-selall")) {
       $$("[data-sel]").forEach((cb) => { cb.checked = el.checked; const id = Number(cb.dataset.sel); el.checked ? S.selected.add(id) : S.selected.delete(id); });
       const c = $("#selCount"); if (c) c.textContent = `${S.selected.size} selected`;
+    } else if (el.dataset.act === "ext-id") {
+      const v = el.value.trim();
+      await save(sb.from("tasks").update({ ext_task_id: v || null }).eq("id", Number(el.dataset.id)), v ? `Task ID ${v} saved` : "Task ID removed");
     } else if (el.dataset.act === "assign-row") {
       await save(sb.from("tasks").update({ assigned_to: el.value || null }).eq("id", Number(el.dataset.id)), "Task reassigned");
     } else if (el.dataset.act === "issue-status") {
@@ -854,7 +929,7 @@
     };
     S.redraw();
   };
-  const batchSelect = (b, field) => `<select class="bsel ${BCLS[b[field]] || ""}" data-act="batch-field" data-field="${field}" data-id="${b.id}" aria-label="${field}">${BATCH_STATUSES.map((x) => `<option ${x === b[field] ? "selected" : ""}>${x}</option>`).join("")}</select>`;
+  const batchSelect = (b, field) => { if (b[field] === "Await") b = { ...b, [field]: "Pending (Writer)" }; return `<select class="bsel ${BCLS[b[field]] || ""}" data-act="batch-field" data-field="${field}" data-id="${b.id}" aria-label="${field}">${BATCH_STATUSES.map((x) => `<option ${x === b[field] ? "selected" : ""}>${x}</option>`).join("")}</select>`; };
 
   // 9.4 Production Tracker (all shows × batches)
   PAGE_FN.production = (main) => {
@@ -864,7 +939,7 @@
       <div class="card" style="margin-bottom:16px">
         <div class="bar">
           <div class="grow"><input type="search" id="pq" placeholder="Search show…" value="${esc(f.q)}" aria-label="Search"></div>
-          <select id="ponly" aria-label="Show only"><option value="">All shows with batches</option><option value="pending" ${f.only === "pending" ? "selected" : ""}>Anything pending</option><option value="writer" ${f.only === "writer" ? "selected" : ""}>Pending from Writer</option><option value="ops" ${f.only === "ops" ? "selected" : ""}>Pending from Ops</option><option value="await" ${f.only === "await" ? "selected" : ""}>Await</option><option value="incomplete" ${f.only === "incomplete" ? "selected" : ""}>Not finished</option></select>
+          <select id="ponly" aria-label="Show only"><option value="">All shows with batches</option><option value="pending" ${f.only === "pending" ? "selected" : ""}>Anything pending</option><option value="writer" ${f.only === "writer" ? "selected" : ""}>Pending from Writer</option><option value="ops" ${f.only === "ops" ? "selected" : ""}>Pending from Ops</option><option value="incomplete" ${f.only === "incomplete" ? "selected" : ""}>Not finished</option></select>
         </div>
         <div class="legend">${BATCH_STATUSES.map((x) => `<span><i class="cell-dot ${BCLS[x]}"></i>${x}</span>`).join("")}<span class="dim">Each cell: <b>L</b> = LOC sheet, <b>A</b> = adapted script</span></div>
         <div id="results"></div>
@@ -879,17 +954,16 @@
       const finished = shows.filter((s) => { const p = progressOf(s); return p.pct === 1; }).length;
       $("#pk").innerHTML = [
         ["Shows tracked", shows.length, ""], ["LOC sheets done", all.filter((b) => b.loc_status === "Done").length, "green"],
-        ["Adapted scripts done", all.filter((b) => b.adapted_status === "Done").length, "green"], ["Pending (Writer)", c("Pending (Writer)"), "amber"],
-        ["Pending (Ops)", c("Pending (Ops)"), "violet"], ["Await", c("Await"), "blue"], ["Shows fully adapted", finished, ""],
+        ["Adapted scripts done", all.filter((b) => b.adapted_status === "Done").length, "green"], ["Pending (Writer)", c("Pending (Writer)") + c("Await"), "amber"],
+        ["Pending (Ops)", c("Pending (Ops)"), "violet"], ["Batch pending", c("Batch pending"), "blue"], ["Shows fully adapted", finished, ""],
       ].map(([l, n, cl]) => `<div class="kpi ${cl}" style="cursor:default"><span>${l}</span><b>${n}</b></div>`).join("");
       const q = f.q.toLowerCase();
       const has = (s, pred) => batchesFor(s.id).some((b) => pred(b.loc_status) || pred(b.adapted_status));
       const list = shows.filter((s) => {
         if (q && !(s.name.toLowerCase().includes(q) || (s.de_title || "").toLowerCase().includes(q))) return false;
         if (f.only === "pending") return has(s, (x) => ["Pending (Writer)", "Pending (Ops)", "Await", "Batch pending"].includes(x));
-        if (f.only === "writer") return has(s, (x) => x === "Pending (Writer)");
+        if (f.only === "writer") return has(s, (x) => x === "Pending (Writer)" || x === "Await");
         if (f.only === "ops") return has(s, (x) => x === "Pending (Ops)");
-        if (f.only === "await") return has(s, (x) => x === "Await");
         if (f.only === "incomplete") return progressOf(s).pct !== 1;
         return true;
       }).sort((a, b) => a.name.localeCompare(b.name));
@@ -906,12 +980,12 @@
             ${cols.map((c0) => {
               const b = byStart.get(c0);
               if (!b) return c0 <= lastCol && isStaff() ? `<td class="mcell empty-cell" data-act="batch" data-show="${s.id}" data-from="${c0}" data-to="${c0 + 99}" title="Not set up yet: click to add"><span>＋</span></td>` : `<td class="mcell off"></td>`;
-              return `<td class="mcell" ${isStaff() ? `data-act="batch" data-show="${s.id}" data-from="${b.ep_from}" data-to="${b.ep_to}"` : ""} title="${b.ep_from}–${b.ep_to} · LOC: ${esc(b.loc_status)} · Adapted: ${esc(b.adapted_status)}${b.notes ? " · " + esc(b.notes) : ""}"><i class="la ${BCLS[b.loc_status]}">L</i><i class="la ${BCLS[b.adapted_status]}">A</i></td>`;
+              return `<td class="mcell" ${isStaff() ? `data-act="batch" data-show="${s.id}" data-from="${b.ep_from}" data-to="${b.ep_to}"` : ""} title="${b.ep_from}–${b.ep_to} · LOC: ${esc(b.loc_status.replace("Await", "Pending (Writer)"))} · Adapted: ${esc(b.adapted_status.replace("Await", "Pending (Writer)"))}${b.notes ? " · " + esc(b.notes) : ""}"><i class="la ${BCLS[b.loc_status]}">L</i><i class="la ${BCLS[b.adapted_status]}">A</i></td>`;
             }).join("")}</tr>`;
         }).join("")}</tbody></table></div>` : `<div class="empty">No shows match. Batches are created on each show page, or come in with the import.</div>`;
       const pend = [];
       for (const b of all) for (const [fld, lab] of [["loc_status", "LOC sheet"], ["adapted_status", "Adapted script"]]) {
-        if (["Pending (Writer)", "Pending (Ops)", "Await", "Batch pending"].includes(b[fld])) pend.push({ b, lab, st: b[fld] });
+        if (["Pending (Writer)", "Pending (Ops)", "Await", "Batch pending"].includes(b[fld])) pend.push({ b, lab, st: b[fld] === "Await" ? "Pending (Writer)" : b[fld] });
       }
       pend.sort((x, y) => x.st.localeCompare(y.st) || showName(x.b.show_id).localeCompare(showName(y.b.show_id)) || x.b.ep_from - y.b.ep_from);
       $("#pend").innerHTML = pend.length ? `<div class="table-wrap"><table><thead><tr><th>Waiting on</th><th>Show</th><th>Batch</th><th>What</th><th>Ops</th><th>Since</th><th>Notes</th></tr></thead><tbody>
@@ -1031,7 +1105,13 @@
   // 9.7 Task Tracker (tasks + team workload in one page)
   PAGE_FN.tracker = (main) => {
     const f = S.f.tracker;
-    main.innerHTML = header("Task Tracker", "Every task and who's working on it. Click a person to see their queue; rows in red are delayed.") + `
+    main.innerHTML = header("Task Tracker", "Every task and who's working on it. Click a person to see their queue; rows in red are delayed.",
+      `<div class="menu-wrap"><button type="button" class="btn" id="expBtn" aria-haspopup="true" aria-expanded="false" title="Download">⋮ Export</button>
+        <div class="menu" id="expMenu" hidden>
+          <button type="button" data-exp="csv">Export to CSV</button>
+          <button type="button" data-exp="xlsx">Export to Excel</button>
+          <p class="menu-note" id="expNote"></p>
+        </div></div>`) + `
       <div class="kpis" id="tk"></div>
       <div class="people" id="ppl"></div>
       <div class="card">
@@ -1053,6 +1133,28 @@
     $("#ppl").onclick = (e) => { const b = e.target.closest("[data-person]"); if (b) { f.person = f.person === b.dataset.person ? "" : b.dataset.person; S.selected.clear(); S.redraw(); } };
     $("#tk").onclick = (e) => { const b = e.target.closest("[data-tk]"); if (!b) return; Object.assign(f, JSON.parse(b.dataset.tk)); S.selected.clear(); route(); };
     const upd = wireBulk(main);
+    let currentList = [];
+    const expBtn = $("#expBtn"), expMenu = $("#expMenu");
+    const closeMenu = () => { expMenu.hidden = true; expBtn.setAttribute("aria-expanded", "false"); };
+    expBtn.onclick = (e) => {
+      e.stopPropagation();
+      const sel = S.selected.size;
+      $("#expNote").textContent = sel ? `Exports the ${sel} ticked task(s).` : `Exports all ${currentList.length} task(s) matching your filters.`;
+      expMenu.hidden = !expMenu.hidden; expBtn.setAttribute("aria-expanded", String(!expMenu.hidden));
+    };
+    document.addEventListener("click", (e) => { if (!e.target.closest(".menu-wrap")) closeMenu(); });
+    expMenu.onclick = (e) => {
+      const b = e.target.closest("[data-exp]"); if (!b) return;
+      const list = S.selected.size ? currentList.filter((t) => S.selected.has(t.id)) : currentList;
+      if (!list.length) { toast("Nothing to export with these filters.", "bad"); return closeMenu(); }
+      const rows = taskExportRows(list);
+      const tag = [f.person && f.person !== "none" && f.person !== "poc" ? nameOf(f.person) : f.person, f.status, f.type, f.special].filter(Boolean).join("-").replace(/[^\w-]+/g, "_");
+      const name = `ShowOps-DE_tasks_${todayStr()}${tag ? "_" + tag : ""}`;
+      if (b.dataset.exp === "csv") downloadBlob(new Blob([toCSV(rows)], { type: "text/csv;charset=utf-8" }), name + ".csv");
+      else downloadBlob(toXLSX(rows, "Tasks"), name + ".xlsx");
+      toast(`Downloaded ${list.length} task(s)`, "good");
+      closeMenu();
+    };
     const ownerKey = (t) => (t.assigned_to ? t.assigned_to : t.poc_name ? "poc:" + t.poc_name : "none");
     const ownerLabel = (k) => (k === "none" ? "Unassigned" : k.startsWith("poc:") ? `${k.slice(4)}* (named in sheet, no account yet)` : nameOf(k));
     S.redraw = () => {
@@ -1083,6 +1185,7 @@
         (!f.special || (f.special === "delayed" ? isDelayed(t) : f.special === "overdue" ? isOverdue(t) : f.special === "today" ? isDueToday(t) : f.special === "waiting" ? (isOpen(t) && t.waiting_on) : isHigh(t)))
       ).sort(prioritySort);
       for (const id of [...S.selected]) if (!list.some((t) => t.id === id)) S.selected.delete(id);
+      currentList = list;
       const opts = { selectable: true, inlineAssign: true, limit: 300, empty: "No tasks match these filters." };
       if (f.group && list.length) {
         const groups = new Map();
@@ -1422,7 +1525,7 @@
     const s = showById(showId);
     if (!s || !isStaff()) return;
     const b = from ? batchesFor(showId).find((x) => x.ep_from === from) : null;
-    const opt = (cur) => BATCH_STATUSES.map((x) => `<option ${x === cur ? "selected" : ""}>${x}</option>`).join("");
+    const opt = (cur) => { if (cur === "Await") cur = "Pending (Writer)"; return BATCH_STATUSES.map((x) => `<option ${x === cur ? "selected" : ""}>${x}</option>`).join(""); };
     openModal(`${s.name} · ${b ? `${b.ep_from}–${b.ep_to}` : "batch"}`, `<form id="bf">
       <div class="form">
         <div><label for="b_from">From episode</label><input id="b_from" type="number" min="1" value="${b?.ep_from ?? from ?? ""}" ${b ? "disabled" : ""} required></div>
