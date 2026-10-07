@@ -32,11 +32,10 @@
     settings: { request_start: "06:00:00", request_end: "18:30:00", timezone: "Asia/Kolkata", tat_days: {}, maq_warn_days: 7 },
     page: "dashboard", param: null, live: false, channel: null, redraw: null, v2: true,
     f: {                     // remembered filters per page
-      shows: { q: "", stage: "", ops: "", source: "", maq: "" },
+      shows: { q: "", stage: "", ops: "", source: "", maq: "", sort: "name" },
       production: { q: "", only: "" },
       maq: { q: "", status: "alerts" },
-      tracker: { q: "", person: "", status: "open", p: "", special: "", type: "" },
-      workload: { person: "", q: "" },
+      tracker: { q: "", person: "", status: "open", p: "", special: "", type: "", group: false },
       blockers: { status: "active", severity: "" },
       mytasks: { filter: "" },
       log: { q: "" },
@@ -51,9 +50,7 @@
     ["maq", "MAQ Alerts", "⏱"],
     ["raise", "Raise Request", "＋"],
     ["tracker", "Task Tracker", "☰"],
-    ["workload", "Team Workload", "◉"],
     ["blockers", "Blockers / Issues", "⚠"],
-    ["status", "Show Status & Timeline", "◷"],
     ["mytasks", "My Tasks", "✓"],
     ["log", "Activity Log", "≡"],
     ["team", "Team & Settings", "⚙"],
@@ -149,7 +146,11 @@
   const openIssues = () => S.issues.filter((i) => i.status !== "Resolved");
 
   // Batch / production rules
-  const batchesFor = (showId) => S.batchesByShow.get(showId) || [];
+  const batchesFor = (showId) => {
+    const s = showById(showId); const all = S.batchesByShow.get(showId) || [];
+    // The old trackers filled "NA" in every column past a show's length; those aren't real batches.
+    return all.filter((b) => !(b.loc_status === "NA" && b.adapted_status === "NA" && s && s.source_eps && b.ep_from > s.source_eps));
+  };
   const COMPLETE = ["Done", "NA", "Early closure"];
   function progressOf(s) {
     const bs = batchesFor(s.id);
@@ -470,6 +471,8 @@
     if (!S.me || !$("#main")) return;
     const raw = (location.hash || "#dashboard").slice(1);
     let [id, param] = raw.split("/");
+    if (id === "workload") id = "tracker";                                   // merged into Task Tracker
+    if (id === "status") { id = "shows"; S.f.shows.sort = "activity"; }      // merged into Shows Master
     if (![...PAGES.map((p) => p[0]), ...HIDDEN_PAGES].includes(id) || (id === "team" && !isManager())) id = "dashboard";
     if (!S.v2 && ["production", "maq", "show"].includes(id)) id = "dashboard";
     S.page = id;
@@ -697,7 +700,7 @@
   PAGE_FN.shows = (main) => {
     const f = S.f.shows;
     const opsNames = [...new Set(S.shows.map(opsOf).filter((n) => n && n !== "—"))].sort();
-    main.innerHTML = header("Shows Master", "Every show with its stage, source, batch progress, owner and MAQ status. Click a show for everything about it.",
+    main.innerHTML = header("Shows Master", "Every show with its stage, source, batch progress, owner, latest task and MAQ status. Click a show for everything about it, or Timeline for its history.",
       isStaff() ? `<button class="btn primary" data-act="add-show" type="button">＋ Add show</button>` : "") + v2Banner() + `
       <div class="card">
         <div class="bar">
@@ -706,11 +709,12 @@
           <select id="sops" aria-label="Ops"><option value="">All Ops</option>${opsNames.map((t) => `<option ${f.ops === t ? "selected" : ""}>${esc(t)}</option>`).join("")}</select>
           <select id="ssrc" aria-label="Source state"><option value="">Any source state</option>${SOURCE_STATES.map((t) => `<option ${f.source === t ? "selected" : ""}>${t}</option>`).join("")}</select>
           <select id="smaq" aria-label="MAQ"><option value="">Any MAQ status</option>${["OVERDUE", "QUEUE TODAY", "COMING UP", "OK", "FIX DATE", "DONE"].map((t) => `<option ${f.maq === t ? "selected" : ""}>${t}</option>`).join("")}</select>
+          <select id="ssort" aria-label="Sort">${[["name", "Sort: Name A–Z"], ["activity", "Sort: Latest activity"], ["maq", "Sort: MAQ runs out first"], ["progress", "Sort: Least progress first"], ["delayed", "Sort: Most delayed tasks"]].map(([v, l]) => `<option value="${v}" ${f.sort === v ? "selected" : ""}>${l}</option>`).join("")}</select>
         </div>
         <div id="results"></div>
       </div>`;
     const bind = (id, key) => { const el = $(id); const h = (e) => { f[key] = e.target.value; S.redraw(); }; if (el.tagName === "SELECT") el.onchange = h; else el.oninput = h; };
-    bind("#sq", "q"); bind("#sstage", "stage"); bind("#sops", "ops"); bind("#ssrc", "source"); bind("#smaq", "maq");
+    bind("#sq", "q"); bind("#sstage", "stage"); bind("#sops", "ops"); bind("#ssrc", "source"); bind("#smaq", "maq"); bind("#ssort", "sort");
     S.redraw = () => {
       const q = f.q.toLowerCase();
       const list = S.shows.map(showInfo).filter((i) => {
@@ -721,8 +725,17 @@
         if (f.source && s.source_state !== f.source) return false;
         if (f.maq && i.maq.status !== f.maq) return false;
         return true;
-      }).sort((a, b) => a.show.name.localeCompare(b.show.name));
-      $("#results").innerHTML = list.length ? `<p class="dim" style="margin:0 0 6px">${list.length} show(s)</p><div class="table-wrap"><table><thead><tr><th>Show</th><th>Stage</th><th>Source</th><th>Batch progress</th><th>Ops</th><th>Open tasks</th><th>Blocker</th><th>MAQ</th><th></th></tr></thead><tbody>
+      });
+      const byName = (a, b) => a.show.name.localeCompare(b.show.name);
+      const SORTS = {
+        name: byName,
+        activity: (a, b) => new Date(b.updated || 0) - new Date(a.updated || 0) || byName(a, b),
+        maq: (a, b) => (a.show.maq_till_date && !["DONE"].includes(a.maq.status) ? a.show.maq_till_date : "9999").localeCompare(b.show.maq_till_date && !["DONE"].includes(b.maq.status) ? b.show.maq_till_date : "9999") || byName(a, b),
+        progress: (a, b) => (a.prog.pct ?? 2) - (b.prog.pct ?? 2) || byName(a, b),
+        delayed: (a, b) => b.delayed - a.delayed || b.openTasks - a.openTasks || byName(a, b),
+      };
+      list.sort(SORTS[f.sort] || byName);
+      $("#results").innerHTML = list.length ? `<p class="dim" style="margin:0 0 6px">${list.length} show(s)</p><div class="table-wrap"><table><thead><tr><th>Show</th><th>Stage</th><th>Source</th><th>Batch progress</th><th>Ops</th><th>Open tasks</th><th>Latest task</th><th>Blocker</th><th>MAQ</th><th></th></tr></thead><tbody>
         ${list.map((i) => { const s = i.show; return `<tr>
           <td>${showLink(s.id, s.name)}${s.de_title ? `<small>${esc(s.de_title)}</small>` : ""}<small>${[s.type, s.show_type, s.genre].filter(Boolean).map(esc).join(" · ")}${s.approved ? "" : " · " + pill("Not approved", "warn")}</small></td>
           <td>${stagePill(s.prod_status)}</td>
@@ -730,9 +743,10 @@
           <td style="min-width:120px">${progressBar(i.prog)}${i.prog.writer || i.prog.ops ? `<small class="wait">${i.prog.writer ? i.prog.writer + " pending writer " : ""}${i.prog.ops ? i.prog.ops + " pending ops" : ""}</small>` : ""}</td>
           <td>${esc(opsOf(s))}</td>
           <td class="num">${i.openTasks}${i.delayed ? ` <small class="late">${i.delayed} late</small>` : ""}</td>
+          <td>${i.latest ? `${esc(i.latest.title)}<small>${statusPill(i.latest.status)} · ${ago(i.updated)}</small>` : '<span class="dim">No request yet</span>'}</td>
           <td>${i.blockers.length ? `<span class="late">${esc(i.blockers[0].description)}</span>` : `<span class="dim">—</span>`}</td>
           <td>${i.maq.tracked ? maqPill(i.maq.status) : '<span class="dim">—</span>'}${i.maq.daysLeft != null ? `<small>${i.maq.daysLeft} d left</small>` : ""}</td>
-          <td><a class="btn sm" href="#show/${s.id}">Open</a></td>
+          <td><div class="row-actions"><a class="btn sm" href="#show/${s.id}">Open</a><button class="btn sm" data-act="timeline" data-id="${s.id}" type="button">Timeline</button></div></td>
         </tr>`; }).join("")}</tbody></table></div>` : `<div class="empty">No shows match.${isStaff() ? " Use “Add show” to create one." : ""}</div>`;
     };
     S.redraw();
@@ -1008,79 +1022,73 @@
     };
   };
 
-  // 9.7 Task Tracker
+  // 9.7 Task Tracker (tasks + team workload in one page)
   PAGE_FN.tracker = (main) => {
     const f = S.f.tracker;
-    main.innerHTML = header("Task Tracker", "Every task. Assign, reassign, update status and reopen completed tasks. Rows in red are delayed.") + `
+    main.innerHTML = header("Task Tracker", "Every task and who's working on it. Click a person to see their queue; rows in red are delayed.") + `
+      <div class="kpis" id="tk"></div>
+      <div class="people" id="ppl"></div>
       <div class="card">
         <div class="bar">
           <div class="grow"><input type="search" id="tq" placeholder="Search task, show or Task ID…" value="${esc(f.q)}" aria-label="Search"></div>
-          <select id="tp" aria-label="Person"><option value="">All people</option><option value="none" ${f.person === "none" ? "selected" : ""}>Unassigned</option>${members().map((p) => `<option value="${p.id}" ${f.person === p.id ? "selected" : ""}>${esc(p.full_name)}</option>`).join("")}</select>
+          <select id="tp" aria-label="Person"></select>
           <select id="ts" aria-label="Status"><option value="">All statuses</option><option value="open" ${f.status === "open" ? "selected" : ""}>All open</option>${STATUSES.map((s) => `<option ${f.status === s ? "selected" : ""}>${s}</option>`).join("")}</select>
           <select id="tt" aria-label="Type"><option value="">All types</option>${TASK_TYPES.map((t) => `<option ${f.type === t ? "selected" : ""}>${t}</option>`).join("")}</select>
           <select id="tl" aria-label="P level"><option value="">All P levels</option>${["P0", "P1", "P2"].map((p) => `<option ${f.p === p ? "selected" : ""}>${p}</option>`).join("")}</select>
           <select id="tx" aria-label="Quick filter"><option value="">Any deadline</option><option value="delayed" ${f.special === "delayed" ? "selected" : ""}>Delayed</option><option value="overdue" ${f.special === "overdue" ? "selected" : ""}>Past deadline</option><option value="today" ${f.special === "today" ? "selected" : ""}>Due today</option><option value="high" ${f.special === "high" ? "selected" : ""}>High priority</option><option value="waiting" ${f.special === "waiting" ? "selected" : ""}>Waiting on someone</option></select>
+          <label class="chk toggle"><input type="checkbox" id="tg" ${f.group ? "checked" : ""}> Group by person</label>
         </div>
         ${bulkBar()}
         <div id="results"></div>
       </div>`;
-    const bind = (id, key) => { const el = $(id); const h = (e) => { f[key] = e.target.value; S.redraw(); }; if (el.tagName === "SELECT") el.onchange = h; else el.oninput = h; };
+    const bind = (id, key) => { const el = $(id); const h = (e) => { f[key] = e.target.value; S.selected.clear(); S.redraw(); }; if (el.tagName === "SELECT") el.onchange = h; else el.oninput = h; };
     bind("#tq", "q"); bind("#tp", "person"); bind("#ts", "status"); bind("#tt", "type"); bind("#tl", "p"); bind("#tx", "special");
+    $("#tg").onchange = (e) => { f.group = e.target.checked; S.redraw(); };
+    $("#ppl").onclick = (e) => { const b = e.target.closest("[data-person]"); if (b) { f.person = f.person === b.dataset.person ? "" : b.dataset.person; S.selected.clear(); S.redraw(); } };
+    $("#tk").onclick = (e) => { const b = e.target.closest("[data-tk]"); if (!b) return; Object.assign(f, JSON.parse(b.dataset.tk)); S.selected.clear(); route(); };
     const upd = wireBulk(main);
+    const ownerKey = (t) => (t.assigned_to ? t.assigned_to : t.poc_name ? "poc:" + t.poc_name : "none");
+    const ownerLabel = (k) => (k === "none" ? "Unassigned" : k.startsWith("poc:") ? `${k.slice(4)}* (named in sheet, no account yet)` : nameOf(k));
     S.redraw = () => {
+      const open = S.tasks.filter(isOpen);
+      const ppl = members();
+      const noOwner = (t) => !t.assigned_to && !t.poc_name;
+      const ALL = { status: "open", person: "", p: "", special: "", q: "", type: "" };
+      $("#tk").innerHTML = [
+        ["Open tasks", open.length, "", { ...ALL }], ["Delayed", open.filter(isDelayed).length, "red", { ...ALL, special: "delayed" }],
+        ["Unassigned", open.filter(noOwner).length, "amber", { ...ALL, person: "none" }], ["Not linked yet*", open.filter((t) => !t.assigned_to && t.poc_name).length, "violet", { ...ALL, person: "poc" }],
+        ["Blocked", open.filter((t) => t.status === "Blocked").length, "", { ...ALL, status: "Blocked" }], ["Completed", S.tasks.filter((t) => t.status === "Completed").length, "green", { ...ALL, status: "Completed" }],
+      ].map(([l, n, c, filt]) => `<button type="button" class="kpi ${c}" data-tk='${esc(JSON.stringify(filt))}'><span>${l}</span><b>${n}</b></button>`).join("");
+      const max = Math.max(1, ...ppl.map((p) => open.filter((t) => t.assigned_to === p.id).length));
+      $("#ppl").innerHTML = ppl.map((p) => {
+        const mine = open.filter((t) => t.assigned_to === p.id);
+        const late = mine.filter(isDelayed).length;
+        return `<button type="button" class="person ${f.person === p.id ? "on" : ""}" data-person="${p.id}" title="Show ${esc(p.full_name)}'s tasks">${avatar(p.id, p.full_name)}<span style="flex:1;min-width:0"><b>${esc(p.full_name)}</b><small>${mine.length} open${late ? ` · <span class="late">${late} delayed</span>` : ""}</small><div class="loadbar"><span style="width:${(mine.length / max) * 100}%"></span></div></span></button>`;
+      }).join("");
+      $("#tp").innerHTML = `<option value="">All people</option><option value="none" ${f.person === "none" ? "selected" : ""}>Unassigned</option><option value="poc" ${f.person === "poc" ? "selected" : ""}>Named in sheet, no account*</option>` +
+        ppl.map((p) => `<option value="${p.id}" ${f.person === p.id ? "selected" : ""}>${esc(p.full_name)}</option>`).join("");
       const q = f.q.toLowerCase();
       const list = S.tasks.filter((t) =>
         (!q || t.title.toLowerCase().includes(q) || showName(t.show_id).toLowerCase().includes(q) || (t.ext_task_id || "").includes(q) || (t.poc_name || "").toLowerCase().includes(q)) &&
-        (!f.person || (f.person === "none" ? !t.assigned_to : t.assigned_to === f.person)) &&
+        (!f.person || (f.person === "none" ? noOwner(t) : f.person === "poc" ? (!t.assigned_to && t.poc_name) : t.assigned_to === f.person)) &&
         (!f.status || (f.status === "open" ? isOpen(t) : t.status === f.status)) &&
         (!f.type || t.task_type === f.type) &&
         (!f.p || t.p_level === f.p) &&
         (!f.special || (f.special === "delayed" ? isDelayed(t) : f.special === "overdue" ? isOverdue(t) : f.special === "today" ? isDueToday(t) : f.special === "waiting" ? (isOpen(t) && t.waiting_on) : isHigh(t)))
       ).sort(prioritySort);
       for (const id of [...S.selected]) if (!list.some((t) => t.id === id)) S.selected.delete(id);
-      $("#results").innerHTML = `<p class="dim" style="margin:0 0 6px">${list.length} task(s)</p>` + taskTable(list, { selectable: true, limit: 300, empty: "No tasks match these filters." });
-      upd && upd();
-    };
-    S.redraw();
-  };
-
-  // 9.8 Team Workload
-  PAGE_FN.workload = (main) => {
-    const f = S.f.workload;
-    main.innerHTML = header("Team Workload", "Pick a person to see their queue, then reassign one or many tasks.") + `
-      <div class="kpis" id="wk"></div>
-      <div class="people" id="ppl"></div>
-      <div class="card">
-        <div class="bar">
-          <select id="wp" aria-label="Person"></select>
-          <div class="grow"><input type="search" id="wq" placeholder="Search their tasks…" value="${esc(f.q)}" aria-label="Search"></div>
-        </div>
-        ${bulkBar()}
-        <div id="results"></div>
-      </div>`;
-    $("#wq").oninput = (e) => { f.q = e.target.value; S.redraw(); };
-    $("#wp").onchange = (e) => { f.person = e.target.value; S.selected.clear(); S.redraw(); };
-    $("#ppl").onclick = (e) => { const b = e.target.closest("[data-person]"); if (b) { f.person = f.person === b.dataset.person ? "" : b.dataset.person; S.selected.clear(); S.redraw(); } };
-    const upd = wireBulk(main);
-    S.redraw = () => {
-      const open = S.tasks.filter(isOpen);
-      const ppl = members();
-      $("#wk").innerHTML = [["People", ppl.length], ["Open tasks", open.length], ["Delayed", open.filter(isDelayed).length], ["Unassigned", open.filter((t) => !t.assigned_to).length], ["Blocked", open.filter((t) => t.status === "Blocked").length], ["Completed", S.tasks.filter((t) => t.status === "Completed").length]]
-        .map(([l, n]) => `<div class="kpi" style="cursor:default"><span>${l}</span><b>${n}</b></div>`).join("");
-      const max = Math.max(1, ...ppl.map((p) => open.filter((t) => t.assigned_to === p.id).length));
-      $("#ppl").innerHTML = ppl.map((p) => {
-        const mine = open.filter((t) => t.assigned_to === p.id);
-        const late = mine.filter(isDelayed).length;
-        return `<button type="button" class="person ${f.person === p.id ? "on" : ""}" data-person="${p.id}">${avatar(p.id, p.full_name)}<span style="flex:1;min-width:0"><b>${esc(p.full_name)}</b><small>${mine.length} open${late ? ` · <span class="late">${late} delayed</span>` : ""}</small><div class="loadbar"><span style="width:${(mine.length / max) * 100}%"></span></div></span></button>`;
-      }).join("");
-      $("#wp").innerHTML = `<option value="">All team (open tasks)</option><option value="none" ${f.person === "none" ? "selected" : ""}>Unassigned</option>` +
-        ppl.map((p) => `<option value="${p.id}" ${f.person === p.id ? "selected" : ""}>${esc(p.full_name)}</option>`).join("");
-      const q = f.q.toLowerCase();
-      const list = open.filter((t) =>
-        (!f.person || (f.person === "none" ? !t.assigned_to : t.assigned_to === f.person)) &&
-        (!q || t.title.toLowerCase().includes(q) || showName(t.show_id).toLowerCase().includes(q))
-      ).sort(prioritySort);
-      $("#results").innerHTML = taskTable(list, { selectable: true, inlineAssign: true, empty: "No open tasks for this selection." });
+      const opts = { selectable: true, inlineAssign: true, limit: 300, empty: "No tasks match these filters." };
+      if (f.group && list.length) {
+        const groups = new Map();
+        for (const t of list) { const k = ownerKey(t); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(t); }
+        const keys = [...groups.keys()].sort((a, b) => (a === "none") - (b === "none") || ownerLabel(a).localeCompare(ownerLabel(b)));
+        $("#results").innerHTML = `<p class="dim" style="margin:0 0 6px">${list.length} task(s) · ${keys.length} people</p>` + keys.map((k) => {
+          const g = groups.get(k); const late = g.filter(isDelayed).length;
+          return `<div class="group"><h3>${k === "none" || k.startsWith("poc:") ? "" : avatar(k, nameOf(k))} ${esc(ownerLabel(k))} <small>${g.length} task(s)${late ? ` · <span class="late">${late} delayed</span>` : ""}</small></h3>${taskTable(g, { ...opts, hidePerson: true })}</div>`;
+        }).join("");
+      } else {
+        $("#results").innerHTML = `<p class="dim" style="margin:0 0 6px">${list.length} task(s)</p>` + taskTable(list, opts);
+      }
       upd && upd();
     };
     S.redraw();
@@ -1117,21 +1125,6 @@
             <td>${esc(nameOf(i.raised_by))}</td><td>${esc(nameOf(i.owner))}</td><td><small>${fmtDT(i.created_at)}</small></td>
             <td>${can(i) ? `<button class="btn sm" data-act="edit-issue" data-id="${i.id}">Edit</button>` : ""}</td></tr>`;
         }).join("")}</tbody></table></div>` : `<div class="empty">No blockers here. 🎉</div>`;
-    };
-    S.redraw();
-  };
-
-  // 9.10 Show Status & Timeline
-  PAGE_FN.status = (main) => {
-    main.innerHTML = header("Show Status & Timeline", "Each show once, most recently active first. Open a timeline to see its full history.") + `<div class="card"><div id="results"></div></div>`;
-    S.redraw = () => {
-      const list = S.shows.map(showInfo).sort((a, b) => new Date(b.updated || 0) - new Date(a.updated || 0) || a.show.name.localeCompare(b.show.name));
-      $("#results").innerHTML = list.length ? `<div class="table-wrap"><table><thead><tr><th>Show</th><th>Stage</th><th>Task status</th><th>Latest task</th><th>Owner</th><th>Blocker</th><th>Updated</th><th></th></tr></thead><tbody>
-        ${list.map((i) => `<tr><td>${showLink(i.show.id, i.show.name)}<small>${esc(i.show.type)}</small></td><td>${stagePill(i.show.prod_status)}</td><td>${statusPill(i.status)}</td>
-          <td>${i.latest ? esc(i.latest.title) : '<span class="dim">No request raised yet</span>'}</td><td>${esc(i.latest ? assigneeName(i.latest) : opsOf(i.show))}</td>
-          <td>${i.blockers.length ? `<span class="late">${esc(i.blockers[0].description)}</span>` : '<span class="dim">—</span>'}</td>
-          <td><small>${fmtDT(i.updated)}</small></td><td><button class="btn sm" data-act="timeline" data-id="${i.show.id}">View timeline</button></td></tr>`).join("")}
-        </tbody></table></div>` : `<div class="empty">No shows yet.</div>`;
     };
     S.redraw();
   };
