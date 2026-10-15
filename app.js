@@ -1521,7 +1521,7 @@
     main.innerHTML = header("Error Metrics", "QC issues from the QC tool, summarised by month, issue type and show. Click any number to see the issues behind it.",
       `<div class="menu-wrap"><button type="button" class="btn" id="qExpBtn" aria-haspopup="true" aria-expanded="false">⋮ Export</button>
         <div class="menu" id="qExpMenu" hidden>
-          <button type="button" data-qexp="summary">QC Summary, sheet format (Excel)</button>
+          <button type="button" data-qexp="workbook">QC workbook with formulas (Excel)</button>
           <button type="button" data-qexp="matrix">Monthly summary (Excel)</button>
           <button type="button" data-qexp="shows">By show (Excel)</button>
           <button type="button" data-qexp="issues">Issue list (CSV)</button>
@@ -1578,7 +1578,12 @@
       closeMenu();
       const tag = [f.show ? cur.namer(f.show).name : "", f.month ? qcMonthLabel(f.month) : ""].filter(Boolean).join("_").replace(/[^\w-]+/g, "_");
       const name = `ShowOps-DE_errors_${todayStr()}${tag ? "_" + tag : ""}`;
-      if (b.dataset.qexp === "summary") { downloadBlob(toStyledXLSX(qcSummaryRows(cur.inMonth, cur.shows, !f.month), "QC Summary"), name + "_QC_summary.xlsx"); return toast(`Downloaded QC summary (${cur.shows.length} shows)`, "good"); }
+      if (b.dataset.qexp === "workbook") {
+        toast("Building the workbook…");
+        try { const det = await loadQCDetails(); downloadBlob(await toWorkbookXLSX(qcWorkbook(cur.inMonth, cur.shows, det, cur.namer)), name + "_QC_workbook.xlsx"); toast(`Downloaded QC workbook (${cur.shows.length} shows, ${cur.inMonth.length} issues)`, "good"); }
+        catch (err) { toast(friendly(err), "bad"); }
+        return;
+      }
       if (b.dataset.qexp === "matrix") { downloadBlob(toXLSX(qcMatrixRows(cur.mx), "Monthly summary"), name + "_monthly.xlsx"); return toast("Downloaded monthly summary", "good"); }
       if (b.dataset.qexp === "shows") { downloadBlob(toXLSX(qcShowRows(cur.shows, !f.month), "By show"), name + "_by_show.xlsx"); return toast("Downloaded by-show summary", "good"); }
       toast("Preparing issue list…");
@@ -1671,98 +1676,207 @@
     S.redraw();
   };
 
-  // "QC Summary" export in the same layout as the old "Summary" sheet (one row per show, one column per issue type).
-  function qcSummaryRows(rows, shows, allTime) {
-    const T = new Map();                     // issue_key → { label, sev }
-    for (const r of rows) if (!T.has(r.issue_key)) T.set(r.issue_key, { key: r.issue_key, label: qcLabel(r.issue_key, r.issue_type), sev: qcSev(r) });
-    const byLabel = (a, b) => a.label.localeCompare(b.label);
-    const major = [...T.values()].filter((t) => t.sev === "Major").sort(byLabel);
-    const minor = [...T.values()].filter((t) => t.sev === "Minor").sort(byLabel);
-    const uncl = [...T.values()].filter((t) => t.sev === "Unclassified").sort(byLabel);
-    const per = new Map();                   // show → { months:Set, epMin, epMax }
-    for (const r of rows) {
-      let p = per.get(r.de_show_id); if (!p) per.set(r.de_show_id, (p = { months: new Set(), epMin: null, epMax: null }));
-      p.months.add(r.month);
-      if (r.ep_no != null) { p.epMin = p.epMin == null ? r.ep_no : Math.min(p.epMin, r.ep_no); p.epMax = p.epMax == null ? r.ep_no : Math.max(p.epMax, r.ep_no); }
-    }
-    const mon = (ym) => (ym && ym !== "unknown" ? MON[Number(ym.slice(5, 7)) - 1] : "");
-    const H = (v, s) => ({ v, s });
-    const groups = [["EP Details (Grouped)", 5, 4], ["Major Errors (Grouped)", 11, major.length + 1], ["Minor Errors (Grouped)", 11 + major.length + 1, minor.length + 1]];
-    if (uncl.length) groups.push(["Unclassified (Grouped)", 11 + major.length + minor.length + 2, uncl.length + 1]);
-    const head = [H("S. No.", 2), H("SHOW NAMES", 2), H("Show IDs", 2), H("DE title", 2), H("QC'd months (dump)", 2), H("Ep Count", 2), H("First EP with error", 3), H("Last EP with error", 3), H("Additional EPs", 3),
-      H("Total Errors", 2), H("Total Errors Per Episode", 2),
-      H("Major Errors", 2), ...major.map((t) => H(t.label, 3)), H("Minor Errors", 2), ...minor.map((t) => H(t.label, 3)),
-      ...(uncl.length ? [H("Unclassified", 2), ...uncl.map((t) => H(t.label, 3))] : []),
+  // ---------- "QC workbook" export: the cleaned dump + a Summary and Monthly sheet built from live formulas ----------
+  // Sheets: Summary · Monthly · QC Dump (clean) · Quantification · Show IDs. Change a severity in Quantification
+  // or an Ep Count in Show IDs and every formula updates, the same way the old manual workbook worked.
+  const WB = { dump: "QC Dump (clean)", quant: "Quantification", shows: "Show IDs", sum: "Summary", mon: "Monthly" };
+  const qref = (sheet, col) => `'${sheet}'!$${col}:$${col}`;
+  const xcol = (i) => { let s = ""; i++; while (i) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; };
+  function excelSerial(ts) {            // timestamp → Excel date number, in the team's time zone
+    const p = Object.fromEntries(new Intl.DateTimeFormat("en-GB", { timeZone: tz(), year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" })
+      .formatToParts(new Date(ts)).map((x) => [x.type, Number(x.value)]));
+    return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute) / 86400000 + 25569;
+  }
+
+  const wbMonth = (ym) => (ym && ym !== "unknown" ? `${ym} (${MON[Number(ym.slice(5, 7)) - 1]})` : "");
+  function qcWorkbook(rows, shows, det, namer) {
+    const V = (v, s = 6) => ({ v: v ?? "", s });
+    const F = (f, v, s = 6) => ({ f, v, s });
+    const H = (v, s = 2) => ({ v, s });
+
+    // 1. QC Dump (clean): one row per issue, cleaned. Severity, Stage and the unique-episode flags are formulas.
+    const sorted = rows.slice().sort((a, b) => namer(a.de_show_id, a.show_title).name.localeCompare(namer(b.de_show_id, b.show_title).name) || (a.ep_no ?? 0) - (b.ep_no ?? 0) || a.id - b.id);
+    const DH = ["Show ID", "Show name", "DE title", "Chapter ID", "Episode title", "Ep No", "Time", "Status", "Remarks", "Category", "Issue type (QC tool)", "Issue type", "Severity", "Reviewer", "Audio status", "Stage", "Logged", "Month", "Unique ep (error)", "Unique ep (Major)", "Unique ep (Minor)"];
+    const dump = [DH.map((h, i) => H(h, i >= 11 && i !== 13 && i !== 14 ? 3 : 2))];
+    const seenA = new Map(), seenS = new Map();
+    sorted.forEach((r, i) => {
+      const n = i + 2, d = det.get(r.id) || {}, sev = qcSev(r);
+      const first = (crit) => `COUNTIFS($A$2:$A${n},$A${n},$D$2:$D${n},$D${n},$M$2:$M${n},${crit})`;
+      const ek = r.de_show_id + "|" + (r.chapter_id || ""), sk = ek + "|" + sev;
+      const seenAny = sev === "Not an error" ? 0 : (seenA.set(ek, (seenA.get(ek) || 0) + 1), seenA.get(ek));
+      const seenSev = (seenS.set(sk, (seenS.get(sk) || 0) + 1), seenS.get(sk));
+      dump.push([
+        V(r.de_show_id, 0), V(namer(r.de_show_id, r.show_title).name, 0), V(r.show_title, 0), V(r.chapter_id, 0), V(d.episode_title, 0), V(r.ep_no, 0), V(d.time_range, 0),
+        V(qcStatus(r.status), 0), V(d.remarks, 0), V(r.category, 0), V(r.issue_type, 0), V(qcLabel(r.issue_key, r.issue_type), 0),
+        F(`IFERROR(IF(VLOOKUP(L${n},'${WB.quant}'!$A:$B,2,FALSE)&""="","Unclassified",VLOOKUP(L${n},'${WB.quant}'!$A:$B,2,FALSE)),"Unclassified")`, sev, 0),
+        V(d.reviewer, 0), V(r.audio_status, 0),
+        F(`IF(OR(O${n}="Issues found in master",O${n}="Final master"),"Master",IF(OR(O${n}="Ready for Master",O${n}="Issues found in raw",O${n}="Raw under QC",O${n}="Issues resolved in raw"),"Raw","-"))`, r.stage === "—" ? "-" : r.stage, 0),
+        r.logged_at ? V(excelSerial(r.logged_at), 13) : V("", 0), V(wbMonth(r.month), 0),
+        F(`IF(M${n}="Not an error",0,IF(${first('"<>Not an error"')}=1,1,0))`, sev !== "Not an error" && seenAny === 1 ? 1 : 0, 0),
+        F(`IF(M${n}<>"Major",0,IF(${first('"Major"')}=1,1,0))`, sev === "Major" && seenSev === 1 ? 1 : 0, 0),
+        F(`IF(M${n}<>"Minor",0,IF(${first('"Minor"')}=1,1,0))`, sev === "Minor" && seenSev === 1 ? 1 : 0, 0),
+      ]);
+    });
+    const D = (c) => qref(WB.dump, c);
+
+    // 2. Quantification: every issue type → Major / Minor / Not an error (edit here to re-classify)
+    const types = new Map();
+    for (const t of QC.types.values()) if (!types.has(t.label)) types.set(t.label, t.severity || "");
+    for (const r of rows) { const l = qcLabel(r.issue_key, r.issue_type); if (!types.has(l)) types.set(l, qcSev(r) === "Unclassified" ? "" : qcSev(r)); }
+    const quant = [[H("Issue type"), H("Severity")], ...[...types.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([l, s]) => [V(l, 0), V(s, 0)])];
+
+    // 3. Show IDs: name + total QC'd episodes (Ep Count)
+    const ids = [...new Set([...shows.map((s) => s.id), ...QC.meta.keys()])];
+    const showRows = [[H("DE show ID"), H("Show name"), H("DE title"), H("QC'd episodes (Ep Count)")], ...ids.map((id) => { const n = namer(id); return [V(id, 0), V(n.name, 0), V(n.de, 0), V(QC.meta.get(id)?.ep_count ?? "", 0)]; })];
+
+    // 4. Summary: same layout as the old "Summary" tab, every number is a COUNTIFS on the clean dump
+    const byLabel = (a, b) => a.localeCompare(b);
+    const used = (sev) => [...new Set(rows.filter((r) => qcSev(r) === sev).map((r) => qcLabel(r.issue_key, r.issue_type)))].sort(byLabel);
+    const major = used("Major"), minor = used("Minor"), uncl = used("Unclassified");
+    const head = [H("S. No."), H("SHOW NAMES"), H("Show IDs"), H("DE title"), H("QC'd months (dump)"), H("Ep Count"), H("First EP with error", 3), H("Last EP with error", 3), H("Additional EPs", 3),
+      H("Total Errors"), H("Total Errors Per Episode"), H("Major Errors"), ...major.map((t) => H(t, 3)), H("Minor Errors"), ...minor.map((t) => H(t, 3)),
+      ...(uncl.length ? [H("Unclassified"), ...uncl.map((t) => H(t, 3))] : []),
       H("Pending", 4), H("Resolved", 4), H("Ignore", 4),
       H("Unique Ep with error", 5), H("Unique Error Rate", 5), H("Unique Ep with Major error", 5), H("Unique Error Major Rate", 5), H("Unique Ep with Minor error", 5), H("Unique Error Minor Rate", 5)];
+    const at = (name) => xcol(head.findIndex((h) => h.v === name));
+    const groups = [["EP Details (Grouped)", 5, 4], ["Major Errors (Grouped)", 11, major.length + 1], ["Minor Errors (Grouped)", 11 + major.length + 1, minor.length + 1]];
+    if (uncl.length) groups.push(["Unclassified (Grouped)", 11 + major.length + minor.length + 2, uncl.length + 1]);
     const top = head.map(() => ({ v: "", s: 1 }));
     for (const [label, col] of groups) top[col] = { v: label, s: 1 };
-    const D = (v, s = 6) => ({ v: v ?? "", s });
-    const rate = (n, d) => (allTime && d ? n / d : "");
+    const mon = (ym) => (ym && ym !== "unknown" ? MON[Number(ym.slice(5, 7)) - 1] : "");
+    const ERR = `${D("M")},"<>Not an error"`;
     const body = shows.map((s, i) => {
-      const p = per.get(s.id) || { months: new Set() };
-      const epsMinor = new Set(rows.filter((r) => r.de_show_id === s.id && qcSev(r) === "Minor").map(epKey)).size;
-      const c = (t) => s.types.get(t.key) || 0;
-      return [D(i + 1), D(s.n.name, 7), D(s.id), D(s.n.de), D([...p.months].sort().map(mon).join(", ")), D(s.qcEps), D(p.epMin), D(p.epMax), D(""),
-        D(s.errs), D(rate(s.errs, s.qcEps), 8),
-        D(s.major), ...major.map((t) => D(c(t))), D(s.minor), ...minor.map((t) => D(c(t))),
-        ...(uncl.length ? [D(s.uncl), ...uncl.map((t) => D(c(t)))] : []),
-        D(s.pending), D(s.resolved), D(s.ignore),
-        D(s.eps.size), D(rate(s.eps.size, s.qcEps), 9), D(s.epsMajor.size), D(rate(s.epsMajor.size, s.qcEps), 9), D(epsMinor), D(rate(epsMinor, s.qcEps), 9)];
+      const n = i + 3, C = `$C${n}`, mine = rows.filter((r) => r.de_show_id === s.id && qcSev(r) !== "Not an error");
+      const eps = mine.map((r) => r.ep_no).filter((x) => x != null);
+      const cnt = (label, sev) => mine.filter((r) => qcLabel(r.issue_key, r.issue_type) === label && qcSev(r) === sev).length;
+      const typeCell = (label, sev) => { const col = xcol(head.findIndex((h) => h.v === label && h.s === 3 && (sev === "Major" ? major : sev === "Minor" ? minor : uncl).includes(label))); return F(`COUNTIFS(${D("A")},${C},${D("L")},${col}$2,${D("M")},"${sev}")`, cnt(label, sev)); };
+      const minorEps = new Set(mine.filter((r) => qcSev(r) === "Minor").map(epKey)).size;
+      const rate = (col, v) => F(`IFERROR(${col}${n}/$F${n},"")`, s.qcEps ? v / s.qcEps : "", 9);
+      return [V(i + 1), V(s.n.name, 7), V(s.id), V(s.n.de), V([...new Set(mine.map((r) => r.month))].sort().map(mon).join(", ")),
+        F(`IFERROR(VLOOKUP(${C},'${WB.shows}'!$A:$D,4,FALSE)+0,"")`, s.qcEps ?? ""),
+        F(`IFERROR(_xlfn.MINIFS(${D("F")},${D("A")},${C},${ERR}),"")`, eps.length ? Math.min(...eps) : ""),
+        F(`IFERROR(_xlfn.MAXIFS(${D("F")},${D("A")},${C},${ERR}),"")`, eps.length ? Math.max(...eps) : ""), V(""),
+        F(`${at("Major Errors")}${n}+${at("Minor Errors")}${n}${uncl.length ? `+${at("Unclassified")}${n}` : ""}`, s.errs),
+        F(`IFERROR(${at("Total Errors")}${n}/$F${n},"")`, s.qcEps ? s.errs / s.qcEps : "", 8),
+        F(`COUNTIFS(${D("A")},${C},${D("M")},"Major")`, s.major), ...major.map((t) => typeCell(t, "Major")),
+        F(`COUNTIFS(${D("A")},${C},${D("M")},"Minor")`, s.minor), ...minor.map((t) => typeCell(t, "Minor")),
+        ...(uncl.length ? [F(`COUNTIFS(${D("A")},${C},${D("M")},"Unclassified")`, s.uncl), ...uncl.map((t) => typeCell(t, "Unclassified"))] : []),
+        F(`COUNTIFS(${D("A")},${C},${D("H")},"Pending",${ERR})`, s.pending), F(`COUNTIFS(${D("A")},${C},${D("H")},"Resolved",${ERR})`, s.resolved), F(`COUNTIFS(${D("A")},${C},${D("H")},"Ignore",${ERR})`, s.ignore),
+        F(`SUMIFS(${D("S")},${D("A")},${C})`, s.eps.size), rate(at("Unique Ep with error"), s.eps.size),
+        F(`SUMIFS(${D("T")},${D("A")},${C})`, s.epsMajor.size), rate(at("Unique Ep with Major error"), s.epsMajor.size),
+        F(`SUMIFS(${D("U")},${D("A")},${C})`, minorEps), rate(at("Unique Ep with Minor error"), minorEps)];
     });
-    // Totals row: sums for counts, overall rates for ratios
-    const sumCol = (ci, withEps) => body.reduce((n, r) => n + (typeof r[ci].v === "number" && (!withEps || typeof r[5].v === "number") ? r[ci].v : 0), 0);
-    const idx = (name) => head.findIndex((h) => h.v === name);
-    const totals = head.map((h, ci) => {
+    const last = shows.length + 2, tr = last + 1;
+    const total = head.map((h, ci) => {
+      const c = xcol(ci), sum = (st = 10) => F(`SUM(${c}3:${c}${last})`, body.reduce((a, r) => a + (typeof r[ci].v === "number" ? r[ci].v : 0), 0), st);
       if (ci === 1) return { v: "Total", s: 10 };
       if (ci < 9 && ci !== 5) return { v: "", s: 10 };
-      const name = h.v;
-      if (name === "Total Errors Per Episode") { const e = sumCol(idx("Ep Count")); return { v: allTime && e ? sumCol(idx("Total Errors"), true) / e : "", s: 12 }; }
-      if (/Rate$/.test(name)) { const e = sumCol(idx("Ep Count")); const base = name.includes("Major") ? "Unique Ep with Major error" : name.includes("Minor") ? "Unique Ep with Minor error" : "Unique Ep with error"; return { v: allTime && e ? sumCol(idx(base), true) / e : "", s: 11 }; }
-      return { v: sumCol(ci), s: 10 };
+      if (h.v === "Total Errors Per Episode") return F(`IFERROR(SUMIFS(${at("Total Errors")}3:${at("Total Errors")}${last},$F3:$F${last},">0")/F${tr},"")`, "", 12);
+      if (/Rate$/.test(h.v)) { const base = at(h.v.includes("Major") ? "Unique Ep with Major error" : h.v.includes("Minor") ? "Unique Ep with Minor error" : "Unique Ep with error"); return F(`IFERROR(SUMIFS(${base}3:${base}${last},$F3:$F${last},">0")/F${tr},"")`, "", 11); }
+      return sum();
     });
-    const merges = groups.map(([, col, span]) => [col, span]);
-    return { rows: [top, head, ...body, totals], merges };
+
+    // 5. Monthly: issue types × months, COUNTIFS on the clean dump
+    const months = [...new Set(rows.map((r) => r.month).filter((m) => m && m !== "unknown"))].sort();
+    const mh = [H("Severity"), H("Issue type"), ...months.map((m) => H(wbMonth(m), 3)), H("Total")];
+    const mrows = [mh];
+    const mc = (m) => xcol(2 + months.indexOf(m));
+    for (const [sev, list] of [["Major", major], ["Minor", minor], ["Unclassified", uncl]]) {
+      if (!list.length) continue;
+      const n = mrows.length + 1;
+      mrows.push([V(sev, 10), V(`All ${sev}`, 10), ...months.map((m) => F(`COUNTIFS(${D("M")},$A${n},${D("R")},${mc(m)}$1)`, rows.filter((r) => qcSev(r) === sev && r.month === m).length, 10)), F(`SUM(C${n}:${xcol(1 + months.length)}${n})`, "", 10)]);
+      for (const t of list) {
+        const k = mrows.length + 1;
+        mrows.push([V(sev), V(t), ...months.map((m) => F(`COUNTIFS(${D("L")},$B${k},${D("M")},$A${k},${D("R")},${mc(m)}$1)`, rows.filter((r) => qcSev(r) === sev && r.month === m && qcLabel(r.issue_key, r.issue_type) === t).length)), F(`SUM(C${k}:${xcol(1 + months.length)}${k})`, "")]);
+      }
+    }
+    const tn = mrows.length + 1;
+    mrows.push([V("", 10), V("Total errors", 10), ...months.map((m) => F(`COUNTIFS(${ERR},${D("R")},${mc(m)}$1)`, rows.filter((r) => qcSev(r) !== "Not an error" && r.month === m).length, 10)), F(`SUM(C${tn}:${xcol(1 + months.length)}${tn})`, "", 10)]);
+    const pn = mrows.length + 1;
+    mrows.push([V("", 10), V("Pending", 10), ...months.map((m) => F(`COUNTIFS(${D("H")},"Pending",${ERR},${D("R")},${mc(m)}$1)`, rows.filter((r) => qcSev(r) !== "Not an error" && r.month === m && r.st === "pending").length, 10)), F(`SUM(C${pn}:${xcol(1 + months.length)}${pn})`, "", 10)]);
+
+    return [
+      { name: WB.sum, rows: [top, head, ...body, total], merges: groups.map(([, c, span]) => `${xcol(c)}1:${xcol(c + span - 1)}1`), freeze: [2, 2], filter: `A2:${xcol(head.length - 1)}${last}`, widths: head.map((_, ci) => [6, 32, 44, 32, 14][ci] || 13), tallRow: 2 },
+      { name: WB.mon, rows: mrows, freeze: [2, 1], widths: mh.map((_, ci) => (ci === 1 ? 34 : 12)), tallRow: 1 },
+      { name: WB.dump, rows: dump, freeze: [0, 1], filter: `A1:${xcol(DH.length - 1)}${dump.length}`, widths: [44, 30, 30, 44, 36, 7, 11, 10, 60, 9, 24, 24, 12, 30, 20, 9, 16, 9, 9, 9, 9], tallRow: 1 },
+      { name: WB.quant, rows: quant, freeze: [0, 1], widths: [36, 14] },
+      { name: WB.shows, rows: showRows, freeze: [0, 1], widths: [44, 36, 36, 14] },
+    ];
   }
-  // Styled .xlsx writer (cells are {v, s}); styles match the old Summary sheet colours.
-  function toStyledXLSX(sheet, sheetName) {
+
+  // Zip with real compression (the workbook holds every remark, so stored = ~15 MB; deflated ≈ 2 MB).
+  async function zipDeflate(files) {
+    if (typeof CompressionStream === "undefined") return zip(files);
+    const parts = [], central = []; let offset = 0; const enc = new TextEncoder();
+    for (const f of files) {
+      const comp = new Uint8Array(await new Response(new Blob([f.data]).stream().pipeThrough(new CompressionStream("deflate-raw"))).arrayBuffer());
+      const nm = enc.encode(f.name), crc = crc32(f.data);
+      const h = new DataView(new ArrayBuffer(30));
+      h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(8, 8, true);
+      h.setUint32(14, crc, true); h.setUint32(18, comp.length, true); h.setUint32(22, f.data.length, true); h.setUint16(26, nm.length, true);
+      parts.push(new Uint8Array(h.buffer), nm, comp);
+      const c = new DataView(new ArrayBuffer(46));
+      c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true); c.setUint16(10, 8, true);
+      c.setUint32(16, crc, true); c.setUint32(20, comp.length, true); c.setUint32(24, f.data.length, true); c.setUint16(28, nm.length, true); c.setUint32(42, offset, true);
+      central.push(new Uint8Array(c.buffer), nm);
+      offset += 30 + nm.length + comp.length;
+    }
+    const cs = central.reduce((n, a) => n + a.length, 0);
+    const e = new DataView(new ArrayBuffer(22));
+    e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true); e.setUint32(12, cs, true); e.setUint32(16, offset, true);
+    return new Blob([...parts, ...central, new Uint8Array(e.buffer)], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  }
+  // Multi-sheet .xlsx writer: cells are {v, s} or {f, v, s} (formula + its current value). Colours match the old workbook.
+  function toWorkbookXLSX(sheets) {
     const x = (v) => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "");
-    const col = (i) => { let s = ""; i++; while (i) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; };
-    const { rows, merges } = sheet;
-    const data = rows.map((r, ri) => `<row r="${ri + 1}"${ri === 1 ? ' ht="48" customHeight="1"' : ""}>${r.map((c, ci) => {
-      const ref = col(ci) + (ri + 1), st = ` s="${c.s || 0}"`;
+    const cellXml = (c, ref) => {
+      const st = c.s ? ` s="${c.s}"` : "";
+      if (c.f) {
+        const isNum = typeof c.v === "number" && isFinite(c.v);
+        return `<c r="${ref}"${st}${isNum ? "" : ' t="str"'}><f>${x(c.f)}</f><v>${isNum ? c.v : x(c.v ?? "")}</v></c>`;
+      }
       if (c.v == null || c.v === "") return c.s ? `<c r="${ref}"${st}/>` : "";
       if (typeof c.v === "number" && isFinite(c.v)) return `<c r="${ref}"${st}><v>${c.v}</v></c>`;
       return `<c r="${ref}" t="inlineStr"${st}><is><t xml:space="preserve">${x(c.v)}</t></is></c>`;
-    }).join("")}</row>`).join("");
-    const widths = rows[1].map((h, ci) => (ci === 1 ? 34 : ci === 2 ? 44 : ci === 3 ? 34 : ci === 4 ? 14 : 13));
+    };
+    const sheetXml = (sh) => {
+      const [fx, fy] = sh.freeze || [0, 0];
+      const pane = fx || fy ? `<pane${fx ? ` xSplit="${fx}"` : ""}${fy ? ` ySplit="${fy}"` : ""} topLeftCell="${xcol(fx)}${fy + 1}" activePane="${fx && fy ? "bottomRight" : fy ? "bottomLeft" : "topRight"}" state="frozen"/>` : "";
+      const data = sh.rows.map((r, ri) => `<row r="${ri + 1}"${sh.tallRow === ri + 1 ? ' ht="45" customHeight="1"' : ""}>${r.map((c, ci) => cellXml(c, xcol(ci) + (ri + 1))).join("")}</row>`).join("");
+      return `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0">${pane}</sheetView></sheetViews>` +
+        `<cols>${(sh.widths || []).map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join("")}</cols><sheetData>${data}</sheetData>` +
+        `${sh.filter ? `<autoFilter ref="${sh.filter}"/>` : ""}${sh.merges && sh.merges.length ? `<mergeCells count="${sh.merges.length}">${sh.merges.map((m) => `<mergeCell ref="${m}"/>`).join("")}</mergeCells>` : ""}</worksheet>`;
+    };
     const fill = (rgb) => `<fill><patternFill patternType="solid"><fgColor rgb="FF${rgb}"/><bgColor indexed="64"/></patternFill></fill>`;
     const B = '<border><left style="thin"><color rgb="FFBFBFBF"/></left><right style="thin"><color rgb="FFBFBFBF"/></right><top style="thin"><color rgb="FFBFBFBF"/></top><bottom style="thin"><color rgb="FFBFBFBF"/></bottom><diagonal/></border>';
     const C = '<alignment horizontal="center" vertical="center" wrapText="1"/>';
-    const xf = (font, fillId, numFmt = 0, align = "") => `<xf numFmtId="${numFmt}" fontId="${font}" fillId="${fillId}" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"${numFmt ? ' applyNumberFormat="1"' : ""}${align ? ' applyAlignment="1">' + align + "</xf>" : "/>"}`;
-    const styles = '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="#,##0.00"/></numFmts>' +
+    const xf = (font, fillId, numFmt = 0, align = "", border = 1) => `<xf numFmtId="${numFmt}" fontId="${font}" fillId="${fillId}" borderId="${border}" xfId="0" applyFont="1" applyFill="1" applyBorder="1"${numFmt ? ' applyNumberFormat="1"' : ""}${align ? ' applyAlignment="1">' + align + "</xf>" : "/>"}`;
+    const styles = '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="2"><numFmt numFmtId="164" formatCode="#,##0.00"/><numFmt numFmtId="165" formatCode="dd-mm-yyyy hh:mm"/></numFmts>' +
       '<fonts count="3"><font><sz val="10"/><name val="Arial"/></font><font><b/><sz val="10"/><name val="Arial"/></font><font><b/><sz val="10"/><color rgb="FFFFFFFF"/><name val="Arial"/></font></fonts>' +
       `<fills count="9"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>${fill("C27BA0")}${fill("FFE599")}${fill("E06666")}${fill("45818E")}${fill("FFF2CC")}${fill("64BE8B")}${fill("F3F3F3")}</fills>` +
       `<borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border>${B}</borders>` +
       '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
-      `<cellXfs count="13"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>` +
+      `<cellXfs count="14"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>` +
       `<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1">${C}</xf>` +   // 1 group title
       xf(2, 2, 0, C) + xf(1, 3, 0, C) + xf(2, 4, 0, C) + xf(2, 5, 0, C) +                                          // 2 purple, 3 yellow, 4 red, 5 teal headers
       xf(0, 6) + xf(1, 6) + xf(1, 7, 164) + xf(0, 6, 9) +                                                            // 6 data, 7 data bold, 8 per-ep (green), 9 percent
-      xf(1, 8) + xf(1, 8, 9) + xf(1, 8, 164) + "</cellXfs>" +                                                        // 10 total, 11 total %, 12 total 2dp
+      xf(1, 8) + xf(1, 8, 9) + xf(1, 8, 164) +                                                                       // 10 total, 11 total %, 12 total 2dp
+      `<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>` +          // 13 date
       '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>';
     const enc = new TextEncoder();
     const f = (name, xml) => ({ name, data: enc.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' + xml) });
-    const last = col(rows[1].length - 1);
-    return zip([
-      f("[Content_Types].xml", '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>'),
+    const names = sheets.map((s) => x(s.name).slice(0, 31));
+    const filters = sheets.map((s, i) => (s.filter ? `<definedName name="_xlnm._FilterDatabase" localSheetId="${i}" hidden="1">'${names[i]}'!$${s.filter.replace(":", ":$").replace(/([A-Z]+)(\d+)/g, "$1$$$2")}</definedName>` : "")).join("");
+    return zipDeflate([
+      f("[Content_Types].xml", `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>${sheets.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>`),
       f("_rels/.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'),
-      f("xl/workbook.xml", `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="${x(sheetName).slice(0, 31)}" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">'${x(sheetName).slice(0, 31)}'!$A$2:$${last}$${rows.length - 1}</definedName></definedNames></workbook>`),
-      f("xl/_rels/workbook.xml.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>'),
+      f("xl/workbook.xml", `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${names.map((n, i) => `<sheet name="${n}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join("")}</sheets>${filters ? `<definedNames>${filters}</definedNames>` : ""}<calcPr calcId="191029" fullCalcOnLoad="1"/></workbook>`),
+      f("xl/_rels/workbook.xml.rels", `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join("")}<Relationship Id="rId${sheets.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`),
       f("xl/styles.xml", styles),
-      f("xl/worksheets/sheet1.xml", `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane xSplit="2" ySplit="2" topLeftCell="C3" activePane="bottomRight" state="frozen"/></sheetView></sheetViews><cols>${widths.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join("")}</cols><sheetData>${data}</sheetData><autoFilter ref="A2:${last}${rows.length - 1}"/>${merges.length ? `<mergeCells count="${merges.length}">${merges.map(([c, n]) => `<mergeCell ref="${col(c)}1:${col(c + n - 1)}1"/>`).join("")}</mergeCells>` : ""}</worksheet>`),
+      ...sheets.map((s, i) => f(`xl/worksheets/sheet${i + 1}.xml`, sheetXml(s))),
     ]);
   }
+
   function qcShowRows(list, allTime) {
     const head = ["Show", "DE title", "DE show ID", "Errors", "Major", "Minor", "Unclassified", "Pending", "Resolved", "Ignored", "Eps with errors", "Eps with Major errors", "QC'd eps", "Errors / QC'd ep", "Eps with errors %", "Top issue type", "Top issue count"];
     return [head, ...list.map((s) => [s.n.name, s.n.de, s.id, s.errs, s.major, s.minor, s.uncl, s.pending, s.resolved, s.ignore, s.eps.size, s.epsMajor.size, s.qcEps ?? "",
