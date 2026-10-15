@@ -305,3 +305,36 @@ label.chk.toggle { min-height: 38px; padding: 0 6px; white-space: nowrap; font-s
 input.inline.tid { width: 92px; font-variant-numeric: tabular-nums; }
 input.inline.tid:placeholder-shown { border-style: dashed; }
 td select[data-act="assign-row"] { min-width: 150px; }
+
+/* v2.4: Error Metrics */
+.qmx-wrap { max-height: 72vh; overflow: auto; border: 1px solid var(--line); border-radius: 10px; }
+table.qmx { border-collapse: separate; border-spacing: 0; }
+table.qmx th { position: sticky; top: 0; background: #fafbfd; z-index: 2; text-align: right; }
+table.qmx th.stick, table.qmx td.stick { position: sticky; left: 0; background: #fff; z-index: 3; min-width: 220px; text-align: left; box-shadow: 1px 0 0 var(--line); }
+table.qmx th.stick { z-index: 4; background: #fafbfd; }
+table.qmx td { padding: 7px 10px; text-align: right; }
+table.qmx td.stick { text-align: left; }
+table.qmx th.qsel { color: var(--accent); box-shadow: inset 0 -2px 0 var(--accent); }
+table.qmx tr.qgrp td { background: #f7f8fb; font-weight: 700; border-top: 1px solid var(--line); }
+table.qmx tr.qgrp td.stick { background: #f7f8fb; }
+table.qmx td.qtype { padding-left: 22px; }
+table.qmx tfoot td { background: #fafbfd; font-weight: 600; border-top: 1px solid var(--line); border-bottom: 0; }
+table.qmx tfoot td.stick { background: #fafbfd; }
+td.qh-major { background: rgba(229, 72, 77, var(--h)); }
+td.qh-minor { background: rgba(242, 153, 0, var(--h)); }
+td.qh-other { background: rgba(79, 70, 229, var(--h)); }
+a.qnum { color: inherit; text-decoration: none; cursor: pointer; font-variant-numeric: tabular-nums; }
+a.qnum:hover { text-decoration: underline; color: var(--accent); }
+a.qnum.sev-major { color: var(--bad); font-weight: 700; }
+a.qnum.sev-minor { color: var(--warn); font-weight: 700; }
+tr.qrow-on td { background: var(--accent-soft); }
+td .x { border: 0; background: none; cursor: pointer; color: var(--muted); padding: 0 2px; }
+td .x:hover { color: var(--accent); }
+.qdl td.qrem { min-width: 280px; max-width: 460px; font-size: 13px; overflow-wrap: anywhere; }
+select.qunset { border-color: var(--accent); background: var(--accent-soft); }
+#qbar { margin-top: 12px; }
+#qshow { max-width: 340px; min-width: 0; }
+table.qmx tr.qgrp td.stick { white-space: nowrap; }
+table.qmx tr.qgrp td.stick small { display: inline; margin-left: 4px; color: var(--muted); font-weight: 500; }
+.top .right { flex-wrap: wrap; justify-content: flex-end; }
+@media (max-width: 600px) { #qshow { max-width: 100%; width: 100%; } .bar select { max-width: 100%; } }

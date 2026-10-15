@@ -1,5 +1,5 @@
 // =====================================================================
-//  ShowOps v2 — app logic.  You don't need to edit this file.
+//  ShowOps v2.4 — app logic.  You don't need to edit this file.
 //  (Your settings go in config.js.)
 // =====================================================================
 (function () {
@@ -40,6 +40,7 @@
       blockers: { status: "active", severity: "" },
       mytasks: { filter: "" },
       log: { q: "" },
+      errors: { q: "", show: "", month: "", category: "", stage: "", status: "", sev: "" },
     },
     selected: new Set(),
   };
@@ -51,6 +52,7 @@
     ["raise", "Raise Request", "＋"],
     ["tracker", "Task Tracker", "☰"],
     ["blockers", "Blockers / Issues", "⚠"],
+    ["errors", "Error Metrics", "◩"],
     ["mytasks", "My Tasks", "✓"],
     ["log", "Activity Log", "≡"],
     ["team", "Team & Settings", "⚙"],
@@ -232,6 +234,7 @@
     if (/duplicate key.*ext_id/i.test(m)) return "A task with that Task ID already exists.";
     if (/duplicate key.*show_batches/i.test(m)) return "That batch already exists for this show.";
     if (/column .* does not exist|Could not find the .* column|relation .*show_batches.* does not exist/i.test(m)) return "The database needs updating: run update-v2.sql in Supabase.";
+    if (/qc_issues|qc_shows|qc_issue_types|qc_log_upload/i.test(m)) return "The database needs updating: run update-v2.4.sql in Supabase.";
     if (/Failed to fetch|NetworkError/i.test(m)) return "Can't reach the server. Check your internet connection.";
     return m;
   }
@@ -391,6 +394,7 @@
           const l = payload.new;
           toast(`${nameOf(l.user_id)}: ${l.action}${l.show_id ? " · " + showName(l.show_id) : ""}`);
         }
+        if (payload.table === "activity_log" && payload.eventType === "INSERT" && payload.new.action === "Uploaded QC dump") QC.loaded = false;   // someone uploaded new QC data
         scheduleReload();
       })
       .subscribe((status) => { S.live = status === "SUBSCRIBED"; const b = $("#live"); if (b) b.outerHTML = liveBadge(); });
@@ -1372,6 +1376,559 @@
     };
     S.redraw();
   };
+
+  // 9.14 Error Metrics (QC issues from the QC tool's dump, summarised by month / issue type / show)
+  const QC_TZ_OFFSET = "+05:30";        // the QC tool's timestamps are India time
+  const QC_SEVS = ["Major", "Minor", "Not an error"];
+  const QC_SEV_ORDER = ["Major", "Minor", "Unclassified", "Not an error"];
+  const QC_SEV_CLS = { Major: "bad", Minor: "warn", Unclassified: "accent", "Not an error": "" };
+  const XLSX_LIB = "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js";
+  const qcKey = (t) => String(t ?? "").trim().replace(/\s*\/\s*/g, "/").replace(/\s+/g, " ").toLowerCase();
+  const QC = { loaded: false, loading: null, rows: [], types: new Map(), meta: new Map(), details: null, err: "" };
+  const qcMonthLabel = (ym) => { if (!ym || ym === "unknown") return "No date"; const [y, m] = ym.split("-").map(Number); return `${MON[m - 1]} ${y}`; };
+  const qcStage = (a) => (/master/i.test(a || "") ? "Master" : /raw|ready for master/i.test(a || "") ? "Raw" : "—");
+  const qcStatus = (s) => { s = String(s || "").trim().toLowerCase(); return s ? s[0].toUpperCase() + s.slice(1) : "—"; };
+  const qcSev = (r) => (QC.types.get(r.issue_key)?.severity) || "Unclassified";
+  const qcLabel = (key, fallback) => QC.types.get(key)?.label || fallback || key;
+  const sevPillQC = (s) => pill(s, QC_SEV_CLS[s] ?? "");
+  const pct = (n, d) => (!d ? "—" : n && n / d < 0.005 ? "<1%" : `${Math.round((n / d) * 100)}%`);
+  const ratio = (n, d) => (d ? (n / d).toFixed(2) : "—");
+
+  // Names: the ShowOps show (matched by DE or US/UK show ID) first, then the QC name list, then the dump's own title.
+  function qcShowIndex() {
+    const m = new Map();
+    for (const s of S.shows) { if (s.us_show_id) m.set(s.us_show_id, s); if (s.de_show_id) m.set(s.de_show_id, s); }
+    return m;
+  }
+  function qcNamer() {
+    const idx = qcShowIndex();
+    const cache = new Map();
+    return (id, title) => {
+      if (cache.has(id)) return cache.get(id);
+      const s = idx.get(id);
+      const out = { name: s ? s.name : QC.meta.get(id)?.name || title || id.slice(0, 10), show: s || null, de: s?.de_title || title || "" };
+      cache.set(id, out);
+      return out;
+    };
+  }
+
+  async function fetchCols(table, cols, orderBy) {
+    const out = [];
+    for (let from = 0; ; from += 1000) {
+      const { data, error } = await sb.from(table).select(cols).order(orderBy, { ascending: true }).range(from, from + 999);
+      if (error) throw error;
+      out.push(...data);
+      if (data.length < 1000) break;
+    }
+    return out;
+  }
+  async function loadQC(force) {
+    if (QC.loading) return QC.loading;
+    if (QC.loaded && !force) return;
+    QC.loading = (async () => {
+      try {
+        const [types, meta, rows] = await Promise.all([
+          fetchCols("qc_issue_types", "key,label,severity", "key"),
+          fetchCols("qc_shows", "de_show_id,name,ep_count", "de_show_id"),
+          fetchCols("qc_issues", "id,de_show_id,show_title,chapter_id,ep_no,status,category,issue_type,issue_key,audio_status,logged_at", "id"),
+        ]);
+        QC.types = new Map(types.map((t) => [t.key, t]));
+        QC.meta = new Map(meta.map((m) => [m.de_show_id, m]));
+        QC.rows = rows.map((r) => ({ ...r, month: r.logged_at ? dateInTz(r.logged_at).slice(0, 7) : "unknown", stage: qcStage(r.audio_status), st: String(r.status || "").toLowerCase() }));
+        QC.details = null; QC.err = ""; QC.loaded = true;
+      } catch (e) { QC.err = friendly(e); QC.loaded = false; }
+      finally { QC.loading = null; }
+    })();
+    return QC.loading;
+  }
+  async function loadQCDetails() {
+    if (QC.details) return QC.details;
+    const rows = await fetchCols("qc_issues", "id,episode_title,time_range,remarks,reviewer", "id");
+    QC.details = new Map(rows.map((r) => [r.id, r]));
+    return QC.details;
+  }
+  async function qcWrite(request, okMsg) {
+    const { error } = await request;
+    if (error) { toast(friendly(error), "bad"); return false; }
+    if (okMsg) toast(okMsg, "good");
+    await loadQC(true);
+    refresh();
+    return true;
+  }
+
+  // The rows that pass the page filters (everything except the month filter).
+  function qcFiltered(f, namer) {
+    const q = f.q.trim().toLowerCase();
+    const hit = new Map();
+    const matches = (r) => {
+      if (!q) return true;
+      if (!hit.has(r.de_show_id)) { const n = namer(r.de_show_id, r.show_title); hit.set(r.de_show_id, [n.name, n.de, r.show_title, r.de_show_id].join(" ").toLowerCase().includes(q)); }
+      return hit.get(r.de_show_id);
+    };
+    return QC.rows.filter((r) =>
+      (!f.show || r.de_show_id === f.show) && matches(r) &&
+      (!f.category || r.category === f.category) && (!f.stage || r.stage === f.stage) &&
+      (!f.status || r.st === f.status) && (!f.sev || qcSev(r) === f.sev));
+  }
+  const isErr = (r) => qcSev(r) !== "Not an error";
+  const epKey = (r) => r.de_show_id + "|" + (r.chapter_id || r.ep_no);
+
+  function qcMatrix(rows) {
+    const months = [...new Set(rows.map((r) => r.month))].sort();
+    const types = new Map();
+    for (const r of rows) {
+      let t = types.get(r.issue_key);
+      if (!t) { t = { key: r.issue_key, label: qcLabel(r.issue_key, r.issue_type), sev: qcSev(r), by: {}, total: 0 }; types.set(r.issue_key, t); }
+      t.by[r.month] = (t.by[r.month] || 0) + 1; t.total++;
+    }
+    const groups = QC_SEV_ORDER.map((sev) => ({ sev, types: [...types.values()].filter((t) => t.sev === sev).sort((a, b) => b.total - a.total || a.label.localeCompare(b.label)) })).filter((g) => g.types.length);
+    const perMonth = (pred) => Object.fromEntries(months.map((m) => [m, rows.filter((r) => r.month === m && pred(r))]));
+    return { months, groups, errs: perMonth(isErr), all: perMonth(() => true) };
+  }
+  function qcMatrixRows(mx) {           // for Excel export
+    const out = [["Severity", "Issue type", ...mx.months.map(qcMonthLabel), "Total"]];
+    for (const g of mx.groups) for (const t of g.types) out.push([g.sev, t.label, ...mx.months.map((m) => t.by[m] || 0), t.total]);
+    const sum = (m) => mx.errs[m].length;
+    out.push(["", "Total errors (Major + Minor + Unclassified)", ...mx.months.map(sum), mx.months.reduce((n, m) => n + sum(m), 0)]);
+    out.push(["", "Episodes with errors", ...mx.months.map((m) => new Set(mx.errs[m].map(epKey)).size), ""]);
+    out.push(["", "Pending", ...mx.months.map((m) => mx.all[m].filter((r) => r.st === "pending").length), ""]);
+    return out;
+  }
+
+  function qcByShow(rows, namer) {
+    const m = new Map();
+    for (const r of rows) {
+      let s = m.get(r.de_show_id);
+      if (!s) { s = { id: r.de_show_id, n: namer(r.de_show_id, r.show_title), errs: 0, major: 0, minor: 0, uncl: 0, pending: 0, resolved: 0, ignore: 0, eps: new Set(), epsMajor: new Set(), types: new Map() }; m.set(r.de_show_id, s); }
+      const sev = qcSev(r);
+      if (sev === "Not an error") continue;
+      s.errs++; s.eps.add(epKey(r));
+      if (sev === "Major") { s.major++; s.epsMajor.add(epKey(r)); } else if (sev === "Minor") s.minor++; else s.uncl++;
+      if (r.st === "pending") s.pending++; else if (r.st === "resolved") s.resolved++; else if (r.st === "ignore") s.ignore++;
+      s.types.set(r.issue_key, (s.types.get(r.issue_key) || 0) + 1);
+    }
+    for (const s of m.values()) {
+      s.qcEps = QC.meta.get(s.id)?.ep_count || null;
+      const top = [...s.types.entries()].sort((a, b) => b[1] - a[1])[0];
+      s.top = top ? { label: qcLabel(top[0]), n: top[1] } : null;
+    }
+    return [...m.values()].sort((a, b) => b.errs - a.errs || a.n.name.localeCompare(b.n.name));
+  }
+
+  PAGE_FN.errors = (main) => {
+    const f = S.f.errors;
+    const staff = isStaff();
+    main.innerHTML = header("Error Metrics", "QC issues from the QC tool, summarised by month, issue type and show. Click any number to see the issues behind it.",
+      `<div class="menu-wrap"><button type="button" class="btn" id="qExpBtn" aria-haspopup="true" aria-expanded="false">⋮ Export</button>
+        <div class="menu" id="qExpMenu" hidden>
+          <button type="button" data-qexp="matrix">Monthly summary (Excel)</button>
+          <button type="button" data-qexp="shows">By show (Excel)</button>
+          <button type="button" data-qexp="issues">Issue list (CSV)</button>
+          <p class="menu-note">Uses the filters on this page.</p>
+        </div></div>
+      ${staff ? `<button class="btn" id="qTypes" type="button">Issue types</button><button class="btn primary" id="qUp" type="button">⤒ Upload QC dump</button>` : ""}`) + v2Banner() + `
+      <div id="qcBody"><div class="card"><div class="empty">Loading QC data…</div></div></div>`;
+
+    const expBtn = $("#qExpBtn"), expMenu = $("#qExpMenu");
+    const closeMenu = () => { expMenu.hidden = true; expBtn.setAttribute("aria-expanded", "false"); };
+    expBtn.onclick = (e) => { e.stopPropagation(); expMenu.hidden = !expMenu.hidden; expBtn.setAttribute("aria-expanded", String(!expMenu.hidden)); };
+    document.addEventListener("click", (e) => { if (!e.target.closest(".menu-wrap")) closeMenu(); });
+    if (staff) { $("#qUp").onclick = () => qcUploadModal(); $("#qTypes").onclick = () => qcTypesModal(); }
+
+    let built = false;
+    let cur = { rows: [], inMonth: [], mx: null, shows: [], namer: null };
+    const build = () => {
+      $("#qcBody").innerHTML = `
+        <div class="card" style="margin-bottom:16px">
+          <div class="bar" style="margin-bottom:0">
+            <div class="grow"><input type="search" id="qq" placeholder="Search show name, DE title or show ID…" value="${esc(f.q)}" aria-label="Search show"></div>
+            <select id="qshow" aria-label="Show"></select>
+            <select id="qmonth" aria-label="Month"></select>
+            <select id="qsev" aria-label="Severity"><option value="">Major + Minor</option>${QC_SEV_ORDER.map((s) => `<option ${f.sev === s ? "selected" : ""}>${s}</option>`).join("")}</select>
+            <select id="qcat" aria-label="Category"><option value="">All categories</option></select>
+            <select id="qstage" aria-label="Stage"><option value="">Raw + Master</option>${["Raw", "Master"].map((s) => `<option ${f.stage === s ? "selected" : ""}>${s}</option>`).join("")}</select>
+            <select id="qst" aria-label="Status"><option value="">All statuses</option>${["pending", "resolved", "ignore"].map((s) => `<option value="${s}" ${f.status === s ? "selected" : ""}>${qcStatus(s)}</option>`).join("")}</select>
+            <button class="btn" id="qclear" type="button">Clear</button>
+          </div>
+        </div>
+        <div class="kpis" id="qk"></div>
+        <div id="qwarn"></div>
+        <div class="card" style="margin-bottom:16px"><h2>Monthly summary by issue type<span class="more dim" id="qmxNote"></span></h2><div id="qmx"></div></div>
+        <div class="card"><h2 id="qshowsH">By show</h2><div id="qshows"></div>
+          <p class="hint">“Errors / QC'd ep” and “Eps with errors %” use each show's total QC'd episodes${staff ? " (✎ to set it)" : ""}, so they only show when Month is “All months”.</p></div>`;
+      const bind = (id, key) => { const el = $(id); const h = (e) => { f[key] = e.target.value; S.redraw(); }; if (el.tagName === "SELECT") el.onchange = h; else el.oninput = h; };
+      bind("#qq", "q"); bind("#qshow", "show"); bind("#qmonth", "month"); bind("#qsev", "sev"); bind("#qcat", "category"); bind("#qstage", "stage"); bind("#qst", "status");
+      $("#qclear").onclick = () => { Object.assign(f, { q: "", show: "", month: "", category: "", stage: "", status: "", sev: "" }); built = false; S.redraw(); };
+      $("#qcBody").onclick = (e) => {
+        const d = e.target.closest("[data-qd]");
+        if (d) return qcDrill(JSON.parse(d.dataset.qd), cur.rows);
+        const s = e.target.closest("[data-qshow]");
+        if (s) { f.show = f.show === s.dataset.qshow ? "" : s.dataset.qshow; f.q = ""; $("#qq").value = ""; S.redraw(); return; }
+        const ed = e.target.closest("[data-qedit]");
+        if (ed) return qcShowModal(ed.dataset.qedit, cur.namer);
+        const cl = e.target.closest("[data-qclassify]");
+        if (cl) return qcTypesModal();
+      };
+      built = true;
+    };
+
+    expMenu.onclick = async (e) => {
+      const b = e.target.closest("[data-qexp]"); if (!b || !cur.mx) return;
+      closeMenu();
+      const tag = [f.show ? cur.namer(f.show).name : "", f.month ? qcMonthLabel(f.month) : ""].filter(Boolean).join("_").replace(/[^\w-]+/g, "_");
+      const name = `ShowOps-DE_errors_${todayStr()}${tag ? "_" + tag : ""}`;
+      if (b.dataset.qexp === "matrix") { downloadBlob(toXLSX(qcMatrixRows(cur.mx), "Monthly summary"), name + "_monthly.xlsx"); return toast("Downloaded monthly summary", "good"); }
+      if (b.dataset.qexp === "shows") { downloadBlob(toXLSX(qcShowRows(cur.shows, !f.month), "By show"), name + "_by_show.xlsx"); return toast("Downloaded by-show summary", "good"); }
+      toast("Preparing issue list…");
+      try { const det = await loadQCDetails(); downloadBlob(new Blob([toCSV(qcIssueRows(cur.inMonth, det, cur.namer))], { type: "text/csv;charset=utf-8" }), name + "_issues.csv"); toast(`Downloaded ${cur.inMonth.length} issue(s)`, "good"); }
+      catch (err) { toast(friendly(err), "bad"); }
+    };
+
+    S.redraw = () => {
+      if (!QC.loaded) {
+        if (QC.err) { $("#qcBody").innerHTML = `<div class="card"><div class="empty">${esc(QC.err)}</div></div>`; built = false; QC.err = ""; return; }
+        loadQC().then(() => { if (S.page === "errors") S.redraw(); });
+        return;
+      }
+      if (!QC.rows.length) {
+        built = false;
+        $("#qcBody").innerHTML = `<div class="card"><div class="empty">No QC data yet.${staff ? " Click <b>Upload QC dump</b> and choose the QC tool's export (CSV or Excel)." : " Ops or a Manager can upload the QC tool's export."}</div></div>`;
+        return;
+      }
+      if (!built || !$("#qk")) build();
+      const namer = qcNamer();
+      const rows = qcFiltered(f, namer);
+      const sevRows = f.sev ? rows : rows.filter(isErr);
+      const inMonth = sevRows.filter((r) => !f.month || r.month === f.month);
+      cur = { rows: sevRows, inMonth, namer, mx: qcMatrix(f.sev ? rows : rows.filter((r) => qcSev(r) !== "Not an error")), shows: qcByShow(inMonth, namer) };
+
+      // filter dropdowns (built from the data)
+      const ids = [...new Set(QC.rows.map((r) => r.de_show_id))].map((id) => ({ id, n: namer(id, QC.rows.find((r) => r.de_show_id === id)?.show_title) })).sort((a, b) => a.n.name.localeCompare(b.n.name));
+      $("#qshow").innerHTML = `<option value="">All shows (${ids.length})</option>` + ids.map(({ id, n }) => `<option value="${esc(id)}" ${f.show === id ? "selected" : ""}>${esc(n.name)} · ${esc(id.slice(0, 8))}</option>`).join("");
+      const months = [...new Set(QC.rows.map((r) => r.month))].sort().reverse();
+      $("#qmonth").innerHTML = `<option value="">All months</option>` + months.map((m) => `<option value="${m}" ${f.month === m ? "selected" : ""}>${qcMonthLabel(m)}</option>`).join("");
+      const cats = [...new Set(QC.rows.map((r) => r.category).filter(Boolean))].sort();
+      $("#qcat").innerHTML = `<option value="">All categories</option>` + cats.map((c) => `<option ${f.category === c ? "selected" : ""}>${esc(c)}</option>`).join("");
+
+      // KPIs (respect the month filter)
+      const errs = inMonth.filter(isErr);
+      const maj = errs.filter((r) => qcSev(r) === "Major").length, min = errs.filter((r) => qcSev(r) === "Minor").length;
+      const pend = errs.filter((r) => r.st === "pending").length, res = errs.filter((r) => r.st === "resolved").length;
+      const eps = new Set(errs.map(epKey)).size;
+      const uncl = [...new Set(QC.rows.filter((r) => qcSev(r) === "Unclassified").map((r) => r.issue_key))];
+      const D = (o) => esc(JSON.stringify({ month: f.month || "", ...o }));
+      $("#qk").innerHTML = [
+        ["Total errors", errs.length, "", D({})], ["Major", maj, "red", D({ sev: "Major" })], ["Minor", min, "amber", D({ sev: "Minor" })],
+        ["Pending", pend, pend ? "red" : "", D({ status: "pending" })], ["Resolved", `${pct(res, errs.length)}`, "green", D({ status: "resolved" })],
+        ["Episodes with errors", eps, "blue", D({})], ["Errors per flagged ep", ratio(errs.length, eps), "violet", D({})],
+      ].map(([l, n, c, d]) => `<button type="button" class="kpi ${c}" data-qd="${d}"><span>${l}</span><b>${n}</b>${l === "Total errors" ? `<small>${f.month ? qcMonthLabel(f.month) : "All months"}</small>` : ""}</button>`).join("");
+      $("#qwarn").innerHTML = uncl.length ? `<div class="banner note">${uncl.length} issue type(s) aren't marked Major or Minor yet (${uncl.slice(0, 4).map((k) => esc(qcLabel(k, QC.rows.find((r) => r.issue_key === k)?.issue_type))).join(", ")}${uncl.length > 4 ? "…" : ""}). They're counted as <b>Unclassified</b>.${staff ? ` <a href="#errors" data-qclassify>Classify them →</a>` : ""}</div>` : "";
+
+      // Monthly matrix (all months, other filters applied)
+      const mx = cur.mx;
+      const max = Math.max(1, ...mx.groups.flatMap((g) => g.types.flatMap((t) => mx.months.map((m) => t.by[m] || 0))));
+      const heat = (n, sev) => (n ? ` style="--h:${(0.08 + 0.55 * (n / max)).toFixed(2)}" class="num qh ${sev === "Major" ? "qh-major" : sev === "Minor" ? "qh-minor" : "qh-other"}"` : ` class="num"`);
+      const errTotal = mx.months.reduce((n, m) => n + mx.errs[m].length, 0);
+      const cell = (n, o, attrs = "") => (n ? `<td${attrs}><a class="qnum" data-qd="${esc(JSON.stringify(o))}">${n}</a></td>` : `<td class="num dim">·</td>`);
+      $("#qmxNote").textContent = mx.months.length > 1 ? `${mx.months.length} months · Month filter doesn't apply here` : "";
+      $("#qmx").innerHTML = mx.groups.length ? `<div class="table-wrap qmx-wrap"><table class="qmx"><thead><tr><th class="stick">Issue type</th>${mx.months.map((m) => `<th class="num ${m === f.month ? "qsel" : ""}">${qcMonthLabel(m)}</th>`).join("")}<th class="num">Total</th><th class="num">Share</th></tr></thead><tbody>
+        ${mx.groups.map((g) => {
+          const sub = (m) => g.types.reduce((n, t) => n + (t.by[m] || 0), 0);
+          const gt = g.types.reduce((n, t) => n + t.total, 0);
+          return `<tr class="qgrp"><td class="stick">${sevPillQC(g.sev)} <small>${g.types.length} type(s)</small></td>${mx.months.map((m) => cell(sub(m), { month: m, sev: g.sev }, ` class="num"`)).join("")}<td class="num"><b>${gt}</b></td><td class="num">${g.sev === "Not an error" ? "—" : pct(gt, errTotal)}</td></tr>` +
+            g.types.map((t) => `<tr><td class="stick qtype">${esc(t.label)}</td>${mx.months.map((m) => cell(t.by[m] || 0, { month: m, key: t.key }, heat(t.by[m] || 0, g.sev))).join("")}<td class="num"><a class="qnum" data-qd="${esc(JSON.stringify({ key: t.key }))}"><b>${t.total}</b></a></td><td class="num dim">${g.sev === "Not an error" ? "—" : pct(t.total, errTotal)}</td></tr>`).join("");
+        }).join("")}
+        </tbody><tfoot>
+          <tr><td class="stick">Total errors</td>${mx.months.map((m) => `<td class="num"><b>${mx.errs[m].length}</b></td>`).join("")}<td class="num"><b>${errTotal}</b></td><td></td></tr>
+          <tr><td class="stick">Episodes with errors</td>${mx.months.map((m) => `<td class="num">${new Set(mx.errs[m].map(epKey)).size}</td>`).join("")}<td class="num">${new Set(mx.months.flatMap((m) => mx.errs[m].map(epKey))).size}</td><td></td></tr>
+          <tr><td class="stick">Errors per flagged ep</td>${mx.months.map((m) => `<td class="num">${ratio(mx.errs[m].length, new Set(mx.errs[m].map(epKey)).size)}</td>`).join("")}<td></td><td></td></tr>
+          <tr><td class="stick">Pending</td>${mx.months.map((m) => { const n = mx.errs[m].filter((r) => r.st === "pending").length; return `<td class="num ${n ? "late" : ""}">${n}</td>`; }).join("")}<td class="num">${mx.months.reduce((n, m) => n + mx.errs[m].filter((r) => r.st === "pending").length, 0)}</td><td></td></tr>
+          <tr><td class="stick">Shows QC'd</td>${mx.months.map((m) => `<td class="num">${new Set(mx.all[m].map((r) => r.de_show_id)).size}</td>`).join("")}<td></td><td></td></tr>
+        </tfoot></table></div>` : `<div class="empty">No issues match these filters.</div>`;
+
+      // By show (respects the month filter)
+      const allTime = !f.month;
+      $("#qshowsH").innerHTML = `By show <small class="dim">${f.month ? qcMonthLabel(f.month) : "All months"} · ${cur.shows.length} show(s)</small>`;
+      $("#qshows").innerHTML = cur.shows.length ? `<div class="table-wrap"><table><thead><tr><th>Show</th><th class="num">Errors</th><th class="num">Major</th><th class="num">Minor</th>${cur.shows.some((s) => s.uncl) ? `<th class="num">Unclass.</th>` : ""}<th class="num">Pending</th><th class="num">Resolved</th><th class="num">Ignored</th><th class="num">Eps with errors</th><th class="num">QC'd eps</th><th class="num">Errors / QC'd ep</th><th class="num">Eps with errors %</th><th>Top issue</th></tr></thead><tbody>
+        ${cur.shows.map((s) => { const o = (x) => esc(JSON.stringify({ month: f.month || "", show: s.id, ...x })); const showUncl = cur.shows.some((z) => z.uncl); return `<tr class="${f.show === s.id ? "qrow-on" : ""}">
+          <td><a class="showlink" data-qshow="${esc(s.id)}" href="#errors" title="Filter to this show">${esc(s.n.name)}</a><small>${s.n.de && s.n.de !== s.n.name ? esc(s.n.de) + " · " : ""}<code>${esc(s.id.slice(0, 12))}…</code>${s.n.show ? ` · <a href="#show/${s.n.show.id}">Show page</a>` : ""}</small></td>
+          <td class="num"><a class="qnum" data-qd="${o({})}"><b>${s.errs}</b></a></td>
+          <td class="num">${s.major ? `<a class="qnum sev-major" data-qd="${o({ sev: "Major" })}">${s.major}</a>` : `<span class="dim">0</span>`}</td>
+          <td class="num">${s.minor ? `<a class="qnum sev-minor" data-qd="${o({ sev: "Minor" })}">${s.minor}</a>` : `<span class="dim">0</span>`}</td>
+          ${showUncl ? `<td class="num">${s.uncl || `<span class="dim">0</span>`}</td>` : ""}
+          <td class="num">${s.pending ? `<a class="qnum late" data-qd="${o({ status: "pending" })}">${s.pending}</a>` : `<span class="dim">0</span>`}</td>
+          <td class="num">${s.resolved}</td><td class="num">${s.ignore}</td>
+          <td class="num">${s.eps.size}</td>
+          <td class="num">${s.qcEps ?? '<span class="dim">—</span>'}${staff ? ` <button class="x" type="button" data-qedit="${esc(s.id)}" title="Set QC'd episodes / name">✎</button>` : ""}</td>
+          <td class="num">${allTime && s.qcEps ? `<b class="${s.errs / s.qcEps >= 2 ? "late" : ""}">${ratio(s.errs, s.qcEps)}</b>` : '<span class="dim">—</span>'}</td>
+          <td class="num">${allTime && s.qcEps ? pct(s.eps.size, s.qcEps) : '<span class="dim">—</span>'}</td>
+          <td>${s.top ? `${esc(s.top.label)} <small>${s.top.n} · ${pct(s.top.n, s.errs)}</small>` : "—"}</td>
+        </tr>`; }).join("")}</tbody></table></div>` : `<div class="empty">No shows match these filters.</div>`;
+    };
+    S.redraw();
+  };
+
+  function qcShowRows(list, allTime) {
+    const head = ["Show", "DE title", "DE show ID", "Errors", "Major", "Minor", "Unclassified", "Pending", "Resolved", "Ignored", "Eps with errors", "Eps with Major errors", "QC'd eps", "Errors / QC'd ep", "Eps with errors %", "Top issue type", "Top issue count"];
+    return [head, ...list.map((s) => [s.n.name, s.n.de, s.id, s.errs, s.major, s.minor, s.uncl, s.pending, s.resolved, s.ignore, s.eps.size, s.epsMajor.size, s.qcEps ?? "",
+      allTime && s.qcEps ? Number((s.errs / s.qcEps).toFixed(3)) : "", allTime && s.qcEps ? Number((s.eps.size / s.qcEps * 100).toFixed(1)) : "", s.top?.label || "", s.top?.n || ""])];
+  }
+  function qcIssueRows(list, det, namer) {
+    const head = ["Show", "DE show ID", "Episode", "Ep no", "Time", "Issue type", "Severity", "Category", "Stage", "Status", "Remarks", "Reviewer", "Logged", "Month"];
+    return [head, ...list.map((r) => { const d = det.get(r.id) || {}; return [namer(r.de_show_id, r.show_title).name, r.de_show_id, d.episode_title || "", r.ep_no ?? "", d.time_range || "", qcLabel(r.issue_key, r.issue_type), qcSev(r), r.category || "", r.stage, qcStatus(r.status), d.remarks || "", d.reviewer || "", r.logged_at ? fmtDT(r.logged_at) : "", qcMonthLabel(r.month)]; })];
+  }
+
+  async function qcDrill(o, rows) {
+    const namer = qcNamer();
+    const list = rows.filter((r) => (!o.month || r.month === o.month) && (!o.key || r.issue_key === o.key) && (!o.show || r.de_show_id === o.show) && (!o.sev || qcSev(r) === o.sev) && (!o.status || r.st === o.status))
+      .sort((a, b) => namer(a.de_show_id).name.localeCompare(namer(b.de_show_id).name) || (a.ep_no ?? 0) - (b.ep_no ?? 0));
+    const title = [o.show ? namer(o.show).name : "", o.key ? qcLabel(o.key) : o.sev || "", o.status ? qcStatus(o.status) : "", o.month ? qcMonthLabel(o.month) : "All months"].filter(Boolean).join(" · ");
+    openModal(`${list.length} issue(s) · ${title}`, `<div id="qdl"><div class="empty">Loading remarks…</div></div>`, null, true);
+    let det;
+    try { det = await loadQCDetails(); } catch (e) { const el = $("#qdl"); if (el) el.innerHTML = `<div class="empty">${esc(friendly(e))}</div>`; return; }
+    const el = $("#qdl"); if (!el) return;
+    const shown = list.slice(0, 300);
+    el.innerHTML = `<div class="bar"><span class="dim">${list.length > 300 ? `Showing 300 of ${list.length}. Download for the full list.` : `${list.length} issue(s)`}</span><button class="btn sm" id="qdlDown" type="button" style="margin-left:auto">Download CSV</button></div>
+      <div class="table-wrap"><table class="qdl"><thead><tr><th>Show / episode</th><th>Time</th><th>Issue</th><th>Status</th><th>Remarks</th></tr></thead><tbody>
+      ${shown.map((r) => { const d = det.get(r.id) || {}; return `<tr><td><b>${esc(namer(r.de_show_id, r.show_title).name)}</b><small>${esc(d.episode_title || (r.ep_no != null ? "Episode " + r.ep_no : ""))}</small></td>
+        <td class="num"><small>${esc(d.time_range || "—")}</small></td>
+        <td>${esc(qcLabel(r.issue_key, r.issue_type))}<small>${sevPillQC(qcSev(r))} ${esc(r.category || "")} · ${esc(r.stage)}</small></td>
+        <td>${pill(qcStatus(r.status), { Pending: "bad", Resolved: "good", Ignore: "" }[qcStatus(r.status)] ?? "")}<small>${r.logged_at ? fmtDT(r.logged_at) : ""}</small></td>
+        <td class="qrem">${esc(d.remarks || "").replace(/\n/g, "<br>")}<small>${esc((d.reviewer || "").replace(/@.*/, ""))}</small></td></tr>`; }).join("")}
+      </tbody></table></div>`;
+    $("#qdlDown").onclick = () => downloadBlob(new Blob([toCSV(qcIssueRows(list, det, namer))], { type: "text/csv;charset=utf-8" }), `ShowOps-DE_issues_${todayStr()}.csv`);
+  }
+
+  function qcShowModal(id, namer) {
+    const n = (namer || qcNamer())(id);
+    const m = QC.meta.get(id) || {};
+    openModal(`QC details · ${n.name}`, `<form id="qsf"><div class="form">
+        <div class="full"><label>DE show ID</label><code>${esc(id)}</code></div>
+        <div class="full"><label for="qs_name">Name ${n.show ? "<small>(comes from Shows Master)</small>" : ""}</label><input id="qs_name" type="text" value="${esc(n.show ? n.show.name : m.name || "")}" ${n.show ? "disabled" : ""} placeholder="Show name"></div>
+        <div><label for="qs_eps">QC'd episodes <small>(total)</small></label><input id="qs_eps" type="text" inputmode="numeric" value="${m.ep_count ?? ""}" placeholder="e.g. 100"></div>
+      </div>
+      <p class="hint">QC'd episodes is used for “Errors / QC'd ep”. Leave it empty if you don't know it.</p>
+      <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn primary">Save</button></div></form>`, (md) => {
+      $("#qsf", md).onsubmit = async (e) => {
+        e.preventDefault();
+        const raw = $("#qs_eps", md).value.trim();
+        if (raw && !/^\d+$/.test(raw)) return toast("QC'd episodes must be a whole number.", "bad");
+        const row = { de_show_id: id, ep_count: raw ? Number(raw) : null };
+        if (!n.show) row.name = $("#qs_name", md).value.trim() || null;
+        else if (m.name !== undefined) row.name = m.name;
+        if (await qcWrite(sb.from("qc_shows").upsert(row), "Saved")) closeModal();
+      };
+    });
+  }
+
+  function qcTypesModal() {
+    const counts = new Map(); const raw = new Map();
+    for (const r of QC.rows) { counts.set(r.issue_key, (counts.get(r.issue_key) || 0) + 1); if (!raw.has(r.issue_key)) raw.set(r.issue_key, r.issue_type); }
+    const keys = [...new Set([...counts.keys(), ...QC.types.keys()])];
+    const rowOf = (k) => ({ key: k, label: QC.types.get(k)?.label || raw.get(k) || k, sev: QC.types.get(k)?.severity || "", n: counts.get(k) || 0 });
+    const list = keys.map(rowOf).sort((a, b) => (!!a.sev - !!b.sev) || b.n - a.n || a.label.localeCompare(b.label));
+    openModal("Issue types: Major or Minor", `<p class="hint" style="margin-top:0">Each issue type from the QC tool counts as Major or Minor. Spelling variants (e.g. “Abrupt cut / Jerk” and “Abrupt cut/ Jerk”) are already merged. Unclassified types are listed first.</p>
+      <form id="qtf"><div class="table-wrap" style="max-height:60vh"><table><thead><tr><th>Issue type</th><th>Counts as</th><th class="num">Issues</th></tr></thead><tbody>
+      ${list.map((t) => `<tr><td><input type="text" class="inline" data-ql="${esc(t.key)}" value="${esc(t.label)}" aria-label="Name"></td>
+        <td><select data-qs="${esc(t.key)}" aria-label="Severity" class="${t.sev ? "" : "qunset"}"><option value="">Unclassified</option>${QC_SEVS.map((s) => `<option ${s === t.sev ? "selected" : ""}>${s}</option>`).join("")}</select></td>
+        <td class="num">${t.n}</td></tr>`).join("")}
+      </tbody></table></div>
+      <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn primary">Save</button></div></form>`, (m) => {
+      $("#qtf", m).onsubmit = async (e) => {
+        e.preventDefault();
+        const changed = [];
+        for (const t of list) {
+          const label = $(`[data-ql="${CSS.escape(t.key)}"]`, m).value.trim() || t.label;
+          const sev = $(`[data-qs="${CSS.escape(t.key)}"]`, m).value || null;
+          const before = QC.types.get(t.key);
+          if (!before ? (sev || label !== t.label) : (before.label !== label || (before.severity || null) !== sev)) changed.push({ key: t.key, label, severity: sev });
+        }
+        if (!changed.length) return closeModal();
+        if (await qcWrite(sb.from("qc_issue_types").upsert(changed), `${changed.length} issue type(s) saved`)) closeModal();
+      };
+    }, true);
+  }
+
+  // ---------- QC dump upload ----------
+  const CP1252 = { 0x20ac: 0x80, 0x201a: 0x82, 0x0192: 0x83, 0x201e: 0x84, 0x2026: 0x85, 0x2020: 0x86, 0x2021: 0x87, 0x02c6: 0x88, 0x2030: 0x89, 0x0160: 0x8a, 0x2039: 0x8b, 0x0152: 0x8c, 0x017d: 0x8e,
+    0x2018: 0x91, 0x2019: 0x92, 0x201c: 0x93, 0x201d: 0x94, 0x2022: 0x95, 0x2013: 0x96, 0x2014: 0x97, 0x02dc: 0x98, 0x2122: 0x99, 0x0161: 0x9a, 0x203a: 0x9b, 0x0153: 0x9c, 0x017e: 0x9e, 0x0178: 0x9f };
+  const utf8 = new TextDecoder("utf-8", { fatal: true });
+  function fixText(v) {                  // "GÃ¶ttin" → "Göttin" (text that was saved as UTF-8 but read as Windows-1252)
+    const s = String(v ?? "").trim();
+    if (!/[ÃÂâ]/.test(s)) return s;
+    const bytes = [];
+    for (const ch of s) { const c = ch.codePointAt(0); if (c < 256) bytes.push(c); else if (CP1252[c] != null) bytes.push(CP1252[c]); else return s; }
+    try { return utf8.decode(new Uint8Array(bytes)); } catch { return s; }
+  }
+  function parseCSV(text) {
+    text = text.replace(/^﻿/, "");
+    const first = text.slice(0, text.indexOf("\n") + 1 || undefined);
+    const delim = [",", ";", "\t"].sort((a, b) => first.split(b).length - first.split(a).length)[0];
+    const rows = []; let row = [], cell = "", q = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (q) { if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += c; }
+      else if (c === '"') q = true;
+      else if (c === delim) { row.push(cell); cell = ""; }
+      else if (c === "\n") { row.push(cell); rows.push(row); row = []; cell = ""; }
+      else if (c !== "\r") cell += c;
+    }
+    if (cell !== "" || row.length) { row.push(cell); rows.push(row); }
+    return rows;
+  }
+  function loadScript(src) {
+    return new Promise((ok, fail) => { if (window.XLSX) return ok(); const s = document.createElement("script"); s.src = src; s.onload = ok; s.onerror = () => fail(new Error("Couldn't load the Excel reader. Check your internet connection, or upload a CSV instead.")); document.head.append(s); });
+  }
+  const NEED = ["show_id", "issue_type", "create_time"];
+  function findTable(grid) {             // header row = first row (in the top 5) that has show_id, issue_type and create_time
+    for (let i = 0; i < Math.min(5, grid.length); i++) {
+      const h = grid[i].map((x) => String(x ?? "").trim().toLowerCase());
+      if (NEED.every((n) => h.includes(n))) return { head: h, body: grid.slice(i + 1), at: i };
+    }
+    return null;
+  }
+  async function readQcFile(file) {
+    if (/\.(xlsx|xlsm|xls)$/i.test(file.name)) {
+      await loadScript(XLSX_LIB);
+      const wb = window.XLSX.read(await file.arrayBuffer(), { type: "array", cellDates: true });
+      for (const name of wb.SheetNames) {
+        // Text exactly as the sheet shows it (so "0:00" stays "0:00"), except create_time, where the real date value is safer.
+        const text = window.XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: false, defval: "" });
+        const t = findTable(text);
+        if (!t) continue;
+        const raw = window.XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: true, defval: "" });
+        const c = t.head.indexOf("create_time");
+        t.body = t.body.map((r, i) => { const v = (raw[t.at + 1 + i] || [])[c]; const out = r.slice(); out[c] = v instanceof Date ? v : r[c]; return out; });
+        return { ...t, sheet: name };
+      }
+      throw new Error("No sheet in this file has the QC dump columns (show_id, issue_type, create_time).");
+    }
+    const t = findTable(parseCSV(await file.text()));
+    if (!t) throw new Error("This file doesn't have the QC dump columns (show_id, issue_type, create_time).");
+    return t;
+  }
+
+  // Dates: the QC tool writes DD-MM-YYYY HH:MM. When a sheet app re-reads that, days 1–12 can flip into
+  // MM-DD (2 Sep → 9 Feb). Fixed dates are read as written; ambiguous ones take whichever reading is
+  // closest to the other dates in the same file.
+  const pad = (n) => String(n).padStart(2, "0");
+  function dateCands(v) {
+    if (v instanceof Date && !isNaN(v)) {
+      const t = new Date(v.getTime() + 30000);
+      const y = t.getFullYear(), m = t.getMonth() + 1, d = t.getDate(), hh = t.getHours(), mi = t.getMinutes();
+      return { sure: false, c: d <= 12 && d !== m ? [{ y, m, d, hh, mi }, { y, m: d, d: m, hh, mi }] : [{ y, m, d, hh, mi }] };
+    }
+    const s = String(v ?? "").trim();
+    let x = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2}))?/);
+    if (x) return { sure: true, c: [{ y: +x[1], m: +x[2], d: +x[3], hh: +(x[4] || 0), mi: +(x[5] || 0) }] };
+    x = s.match(/^(\d{1,2})([-./])(\d{1,2})\2(\d{4})(?:[ T,]+(\d{1,2}):(\d{2}))?/);
+    if (!x) return null;
+    const a = +x[1], b = +x[3], y = +x[4], hh = +(x[5] || 0), mi = +(x[6] || 0);
+    if (x[2] === "-" || a > 12) return { sure: true, c: [{ y, m: b, d: a, hh, mi }] };          // the QC tool's own format, or clearly day-first
+    if (b > 12) return { sure: true, c: [{ y, m: a, d: b, hh, mi }] };
+    return { sure: false, c: a === b ? [{ y, m: b, d: a, hh, mi }] : [{ y, m: b, d: a, hh, mi }, { y, m: a, d: b, hh, mi }] };
+  }
+  const candTime = (c) => Date.UTC(c.y, c.m - 1, c.d, c.hh, c.mi);
+  function resolveDates(values) {
+    const cands = values.map(dateCands);
+    const anchors = cands.filter((x) => x && (x.sure || x.c.length === 1)).map((x) => candTime(x.c[0])).sort((a, b) => a - b);
+    const mid = anchors.length ? anchors[Math.floor(anchors.length / 2)] : null;
+    let fixed = 0;
+    const out = cands.map((x) => {
+      if (!x) return null;
+      let c = x.c[0];
+      if (x.c.length > 1 && mid != null) {
+        const best = x.c.reduce((p, q) => (Math.abs(candTime(q) - mid) < Math.abs(candTime(p) - mid) ? q : p));
+        if (best !== x.c[0]) fixed++;
+        c = best;
+      }
+      return `${c.y}-${pad(c.m)}-${pad(c.d)}T${pad(c.hh)}:${pad(c.mi)}:00${QC_TZ_OFFSET}`;
+    });
+    return { out, fixed, ambiguous: cands.filter((x) => x && x.c.length > 1).length };
+  }
+
+  // Sheet apps turn "0:00" or "7:11" in the time column into clock times; turn them back into text.
+  function timeText(v) {
+    let secs = null;
+    if (v instanceof Date && !isNaN(v)) secs = Math.round((v.getHours() * 3600 + v.getMinutes() * 60 + v.getSeconds() + v.getMilliseconds() / 1000));
+    else if (typeof v === "number" && v >= 0 && v < 1) secs = Math.round(v * 86400);
+    if (secs == null) return String(v ?? "").trim();
+    const h = Math.floor(secs / 3600), mi = Math.floor((secs % 3600) / 60), se = secs % 60;
+    return `${h}:${pad(mi)}${se ? ":" + pad(se) : ""}`;
+  }
+  function buildQcRows(t) {
+    const col = (...names) => { for (const n of names) { const i = t.head.indexOf(n); if (i >= 0) return i; } return -1; };
+    const C = { id: col("show_id"), title: col("show_title"), ch: col("chapter_id"), ept: col("episode_title"), epn: col("ep no", "ep_no", "episode_no"), time: col("time"),
+      st: col("status"), rem: col("remarks"), cat: col("category"), type: col("issue_type"), who: col("user_email"), aud: col("audio_status"), at: col("create_time") };
+    const get = (r, i) => (i >= 0 ? r[i] : "");
+    const body = t.body.filter((r) => String(get(r, C.id)).trim() && String(get(r, C.type)).trim());
+    const skipped = t.body.filter((r) => r.some((v) => String(v ?? "").trim())).length - body.length;
+    const dates = resolveDates(body.map((r) => get(r, C.at)));
+    const seen = new Map();
+    body.forEach((r, i) => {
+      const ept = fixText(get(r, C.ept));
+      const epn = parseInt(get(r, C.epn), 10);
+      const m = ept.match(/(?:episode|ep|folge)\s*(\d+)/i);
+      const row = {
+        de_show_id: String(get(r, C.id)).trim(), show_title: fixText(get(r, C.title)) || null, chapter_id: String(get(r, C.ch)).trim() || null,
+        episode_title: ept || null, ep_no: Number.isFinite(epn) ? epn : m ? Number(m[1]) : null, time_range: timeText(get(r, C.time)) || null,
+        status: String(get(r, C.st)).trim().toLowerCase() || null, remarks: fixText(get(r, C.rem)) || null, category: String(get(r, C.cat)).trim() || null,
+        issue_type: fixText(get(r, C.type)), reviewer: String(get(r, C.who)).trim() || null, audio_status: String(get(r, C.aud)).trim() || null, logged_at: dates.out[i],
+      };
+      seen.set([row.de_show_id, row.chapter_id || "", row.time_range || "", qcKey(row.issue_type), row.remarks || ""].join("|"), row);
+    });
+    const rows = [...seen.values()];
+    return { rows, skipped, dupes: body.length - rows.length, fixedDates: dates.fixed, noDate: rows.filter((r) => !r.logged_at).length };
+  }
+
+  function qcUploadModal() {
+    openModal("Upload QC dump", `<p class="hint" style="margin-top:0">Choose the QC tool's export as <b>CSV</b> or <b>Excel</b>. It needs the columns <code>show_id</code>, <code>issue_type</code> and <code>create_time</code>; the others (status, remarks, category, audio_status…) are picked up by name.</p>
+      <p class="hint">Safe to upload the same or an overlapping dump again: an issue already in ShowOps is updated (e.g. Pending → Resolved), not duplicated.</p>
+      <input type="file" id="qfile" accept=".csv,.xlsx,.xlsm,.xls,text/csv">
+      <div id="qprev" style="margin-top:14px"></div>`, (m) => {
+      $("#qfile", m).onchange = async (e) => {
+        const file = e.target.files[0]; if (!file) return;
+        const pv = $("#qprev", m);
+        pv.innerHTML = `<div class="empty">Reading ${esc(file.name)}…</div>`;
+        let res, t;
+        try { t = await readQcFile(file); res = buildQcRows(t); } catch (err) { pv.innerHTML = `<p class="form-error">${esc(err.message || err)}</p>`; return; }
+        if (!res.rows.length) { pv.innerHTML = `<p class="form-error">No issue rows found in this file.</p>`; return; }
+        const months = {}; for (const r of res.rows) { const k = r.logged_at ? r.logged_at.slice(0, 7) : "unknown"; months[k] = (months[k] || 0) + 1; }
+        const shows = new Set(res.rows.map((r) => r.de_show_id)).size;
+        const known = new Set([...QC.types.keys()]);
+        const newTypes = [...new Set(res.rows.map((r) => qcKey(r.issue_type)))].filter((k) => !known.has(k));
+        pv.innerHTML = `<div class="kvgrid one" style="max-height:none">
+            ${t.sheet ? `<div class="kv"><span>Sheet</span><b>${esc(t.sheet)}</b></div>` : ""}
+            <div class="kv"><span>Issues</span><b>${res.rows.length}</b></div>
+            <div class="kv"><span>Shows</span><b>${shows}</b></div>
+            <div class="kv"><span>Months</span><b>${Object.entries(months).sort().map(([k, n]) => `${qcMonthLabel(k)}: ${n}`).join(" · ")}</b></div>
+            ${res.fixedDates ? `<div class="kv"><span>Dates fixed</span><b>${res.fixedDates} date(s) had day and month swapped by a sheet app; corrected.</b></div>` : ""}
+            ${res.dupes ? `<div class="kv"><span>Duplicates</span><b>${res.dupes} repeated row(s) in the file, kept once.</b></div>` : ""}
+            ${res.skipped ? `<div class="kv"><span>Skipped</span><b>${res.skipped} row(s) without a show ID or issue type.</b></div>` : ""}
+            ${res.noDate ? `<div class="kv"><span>No date</span><b class="late">${res.noDate} row(s) have no readable create_time; they'll show under “No date”.</b></div>` : ""}
+            ${newTypes.length ? `<div class="kv"><span>New issue types</span><b>${newTypes.length} not classified yet: ${esc(newTypes.slice(0, 6).join(", "))}${newTypes.length > 6 ? "…" : ""}. Classify them in “Issue types” after uploading.</b></div>` : ""}
+          </div>
+          <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn primary" id="qgo">Upload ${res.rows.length} issue(s)</button></div>
+          <div class="pbar" id="qbar" hidden><span style="width:0%"></span></div>`;
+        $("#qgo", m).onclick = async () => {
+          const btn = $("#qgo", m); btn.disabled = true;
+          const bar = $("#qbar", m); bar.hidden = false;
+          const size = 500;
+          for (let i = 0; i < res.rows.length; i += size) {
+            const { error } = await sb.from("qc_issues").upsert(res.rows.slice(i, i + size), { onConflict: "row_key" });
+            if (error) { toast(friendly(error), "bad"); btn.disabled = false; btn.textContent = "Try again"; return; }
+            $("span", bar).style.width = `${Math.round(Math.min(1, (i + size) / res.rows.length) * 100)}%`;
+            btn.textContent = `Uploading… ${Math.min(i + size, res.rows.length)} / ${res.rows.length}`;
+          }
+          await sb.rpc("qc_log_upload", { p_rows: res.rows.length, p_details: `${file.name} · ${shows} show(s) · ${Object.keys(months).sort().map(qcMonthLabel).join(", ")}` });
+          toast(`${res.rows.length} issue(s) uploaded`, "good");
+          closeModal();
+          await loadQC(true);
+          if (S.page === "errors") S.redraw(); else go("errors");
+        };
+      };
+    });
+  }
 
   // ---------- 10. Pop-up forms ----------
   function alertsModal() {
