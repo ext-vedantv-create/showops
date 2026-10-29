@@ -40,7 +40,7 @@
       blockers: { status: "active", severity: "" },
       mytasks: { filter: "" },
       log: { q: "" },
-      errors: { q: "", show: "", month: "", category: "", stage: "", status: "", sev: "" },
+      errors: { q: "", show: "", month: "", category: "", stage: "", status: "", sev: "", vm: "" },
     },
     selected: new Set(),
   };
@@ -67,7 +67,7 @@
     "Step 5: Rectify / Re-Gen", "Step 6: SE patchwork", "Step 7: GTG from production", "Launched", "Unpublished", "Not to be picked", "Show Dropped", "On Hold"];
   const SOURCE_STATES = ["Running", "Completed", "Hiatus", "NA"];
   const DE_STATUSES = ["Launch Planned", "Running", "Completed", "Hiatus", "Unpublished"];
-  const MAQ_STATES = ["Running", "Completed", "On Hold"];
+  const MAQ_STATES = ["Not Started", "Running", "Completed", "On Hold", "Haitus", "Not Launched"];   // the DE CMS Scheduling Tracker's own list (and spelling)
 
   // ---------- 2. Small helpers ----------
   const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -172,8 +172,10 @@
   function maqInfo(s) {
     const tracked = !!(s.maq_till_date || s.maq_pattern || s.maq_till_ep);
     if (!tracked) return { tracked: false };
-    const finished = ["On Hold", "Completed"].includes(s.maq_state) || /completed/i.test(s.maq_comments || "") ||
-      (s.source_eps && !/\+/.test(s.source_eps_note || "") && s.maq_till_ep != null && s.maq_till_ep >= s.source_eps);
+    // Queue Alerts sheet: a show drops off when Show state (DE) is On Hold or Completed, the comment says "completed",
+    // or Source Status is Completed AND Source EPs = MAQ done till EP (both from the Scheduling Tracker).
+    const srcDone = s.maq_src_status === "Completed" && s.maq_src_eps != null && String(s.maq_src_eps).trim() !== "" && String(s.maq_src_eps).trim() === String(s.maq_till_ep);
+    const finished = ["On Hold", "Completed"].includes(s.maq_state) || /completed/i.test(s.maq_comments || "") || srcDone;
     if (finished) return { tracked: true, status: "DONE" };
     if (!s.maq_till_date) return { tracked: true, status: "FIX DATE" };
     const d = s.maq_till_date;
@@ -233,6 +235,8 @@
     if (/duplicate key.*shows_name/i.test(m)) return "A show with that name already exists.";
     if (/duplicate key.*ext_id/i.test(m)) return "A task with that Task ID already exists.";
     if (/duplicate key.*show_batches/i.test(m)) return "That batch already exists for this show.";
+    if (/maq_src_eps|maq_src_status/i.test(m)) return "The database needs updating: run update-v2_6-import.sql in Supabase.";
+    if (/voice_model|voice_id|sort_order|start_ep|end_ep|additional_eps|qc_month_master/i.test(m)) return "The database needs updating: run update-v2.5.sql in Supabase.";
     if (/column .* does not exist|Could not find the .* column|relation .*show_batches.* does not exist/i.test(m)) return "The database needs updating: run update-v2.sql in Supabase.";
     if (/qc_issues|qc_shows|qc_issue_types|qc_log_upload/i.test(m)) return "The database needs updating: run update-v2.4.sql in Supabase.";
     if (/Failed to fetch|NetworkError/i.test(m)) return "Can't reach the server. Check your internet connection.";
@@ -1386,7 +1390,7 @@
   const qcKey = (t) => String(t ?? "").trim().replace(/\s*\/\s*/g, "/").replace(/\s+/g, " ").toLowerCase();
   const QC = { loaded: false, loading: null, rows: [], types: new Map(), meta: new Map(), details: null, err: "" };
   const qcMonthLabel = (ym) => { if (!ym || ym === "unknown") return "No date"; const [y, m] = ym.split("-").map(Number); return `${MON[m - 1]} ${y}`; };
-  const qcStage = (a) => (/master/i.test(a || "") ? "Master" : /raw|ready for master/i.test(a || "") ? "Raw" : "—");
+  const qcStage = (a) => (/ready for master|raw/i.test(a || "") ? "Raw" : /master/i.test(a || "") ? "Master" : "—");   // same rule as the workbook's Stage column
   const qcStatus = (s) => { s = String(s || "").trim().toLowerCase(); return s ? s[0].toUpperCase() + s.slice(1) : "—"; };
   const qcSev = (r) => (QC.types.get(r.issue_key)?.severity) || "Unclassified";
   const qcLabel = (key, fallback) => QC.types.get(key)?.label || fallback || key;
@@ -1428,13 +1432,13 @@
     QC.loading = (async () => {
       try {
         const [types, meta, rows] = await Promise.all([
-          fetchCols("qc_issue_types", "key,label,severity", "key"),
-          fetchCols("qc_shows", "de_show_id,name,ep_count", "de_show_id"),
+          fetchCols("qc_issue_types", "key,label,severity,sort_order", "key"),
+          fetchCols("qc_shows", "de_show_id,name,ep_count,start_ep,end_ep,additional_eps,qc_month_master,voice_model,voice_id", "de_show_id"),
           fetchCols("qc_issues", "id,de_show_id,show_title,chapter_id,ep_no,status,category,issue_type,issue_key,audio_status,logged_at", "id"),
         ]);
         QC.types = new Map(types.map((t) => [t.key, t]));
         QC.meta = new Map(meta.map((m) => [m.de_show_id, m]));
-        QC.rows = rows.map((r) => ({ ...r, month: r.logged_at ? dateInTz(r.logged_at).slice(0, 7) : "unknown", stage: qcStage(r.audio_status), st: String(r.status || "").toLowerCase() }));
+        QC.rows = rows.map((r) => ({ ...r, month: r.logged_at ? dateInTz(r.logged_at).slice(0, 7) : "unknown", stage: qcStage(r.audio_status), st: String(r.status || "").toLowerCase(), vm: QC.meta.get(r.de_show_id)?.voice_model || "" }));
         QC.details = null; QC.err = ""; QC.loaded = true;
       } catch (e) { QC.err = friendly(e); QC.loaded = false; }
       finally { QC.loading = null; }
@@ -1467,7 +1471,7 @@
     };
     return QC.rows.filter((r) =>
       (!f.show || r.de_show_id === f.show) && matches(r) &&
-      (!f.category || r.category === f.category) && (!f.stage || r.stage === f.stage) &&
+      (!f.category || r.category === f.category) && (!f.stage || r.stage === f.stage) && (!f.vm || (f.vm === "none" ? !r.vm : r.vm === f.vm)) &&
       (!f.status || r.st === f.status) && (!f.sev || qcSev(r) === f.sev));
   }
   const isErr = (r) => qcSev(r) !== "Not an error";
@@ -1548,6 +1552,7 @@
             <select id="qsev" aria-label="Severity"><option value="">Major + Minor</option>${QC_SEV_ORDER.map((s) => `<option ${f.sev === s ? "selected" : ""}>${s}</option>`).join("")}</select>
             <select id="qcat" aria-label="Category"><option value="">All categories</option></select>
             <select id="qstage" aria-label="Stage"><option value="">Raw + Master</option>${["Raw", "Master"].map((s) => `<option ${f.stage === s ? "selected" : ""}>${s}</option>`).join("")}</select>
+            <select id="qvm" aria-label="Voice model"><option value="">V3 + V4</option>${[["V3 enhanced", "V3 enhanced"], ["V4", "V4"], ["none", "No voice model"]].map(([v, l]) => `<option value="${v}" ${f.vm === v ? "selected" : ""}>${l}</option>`).join("")}</select>
             <select id="qst" aria-label="Status"><option value="">All statuses</option>${["pending", "resolved", "ignore"].map((s) => `<option value="${s}" ${f.status === s ? "selected" : ""}>${qcStatus(s)}</option>`).join("")}</select>
             <button class="btn" id="qclear" type="button">Clear</button>
           </div>
@@ -1555,16 +1560,19 @@
         <div class="kpis" id="qk"></div>
         <div id="qwarn"></div>
         <div class="card" style="margin-bottom:16px"><h2>Monthly summary by issue type<span class="more dim" id="qmxNote"></span></h2><div id="qmx"></div></div>
+        <div class="card" style="margin-bottom:16px"><h2>V3 enhanced vs V4<span class="more dim" id="qvmNote"></span></h2><div id="qvmc"></div></div>
         <div class="card"><h2 id="qshowsH">By show</h2><div id="qshows"></div>
           <p class="hint">“Errors / QC'd ep” and “Eps with errors %” use each show's total QC'd episodes${staff ? " (✎ to set it)" : ""}, so they only show when Month is “All months”.</p></div>`;
       const bind = (id, key) => { const el = $(id); const h = (e) => { f[key] = e.target.value; S.redraw(); }; if (el.tagName === "SELECT") el.onchange = h; else el.oninput = h; };
-      bind("#qq", "q"); bind("#qshow", "show"); bind("#qmonth", "month"); bind("#qsev", "sev"); bind("#qcat", "category"); bind("#qstage", "stage"); bind("#qst", "status");
-      $("#qclear").onclick = () => { Object.assign(f, { q: "", show: "", month: "", category: "", stage: "", status: "", sev: "" }); built = false; S.redraw(); };
+      bind("#qq", "q"); bind("#qshow", "show"); bind("#qmonth", "month"); bind("#qsev", "sev"); bind("#qcat", "category"); bind("#qstage", "stage"); bind("#qst", "status"); bind("#qvm", "vm");
+      $("#qclear").onclick = () => { Object.assign(f, { q: "", show: "", month: "", category: "", stage: "", status: "", sev: "", vm: "" }); built = false; S.redraw(); };
       $("#qcBody").onclick = (e) => {
         const d = e.target.closest("[data-qd]");
         if (d) return qcDrill(JSON.parse(d.dataset.qd), cur.rows);
         const s = e.target.closest("[data-qshow]");
         if (s) { f.show = f.show === s.dataset.qshow ? "" : s.dataset.qshow; f.q = ""; $("#qq").value = ""; S.redraw(); return; }
+        const vmc = e.target.closest("[data-qvm]");
+        if (vmc) { e.preventDefault(); f.vm = f.vm === vmc.dataset.qvm ? "" : vmc.dataset.qvm; S.redraw(); return; }
         const ed = e.target.closest("[data-qedit]");
         if (ed) return qcShowModal(ed.dataset.qedit, cur.namer);
         const cl = e.target.closest("[data-qclassify]");
@@ -1654,12 +1662,29 @@
           <tr><td class="stick">Shows QC'd</td>${mx.months.map((m) => `<td class="num">${new Set(mx.all[m].map((r) => r.de_show_id)).size}</td>`).join("")}<td></td><td></td></tr>
         </tfoot></table></div>` : `<div class="empty">No issues match these filters.</div>`;
 
+      // V3 enhanced vs V4 (respects every filter, including Month)
+      const vmGroups = ["V3 enhanced", "V4", ""].map((vm) => {
+        const ss = cur.shows.filter((s) => (QC.meta.get(s.id)?.voice_model || "") === vm);
+        const sum = (k) => ss.reduce((n, s) => n + (typeof k === "function" ? k(s) : s[k]), 0);
+        const withEps = ss.filter((s) => s.qcEps);
+        return { vm, n: ss.length, errs: sum("errs"), major: sum("major"), minor: sum("minor"), pending: sum("pending"), eps: sum((s) => s.eps.size),
+          qcEps: withEps.reduce((n, s) => n + s.qcEps, 0), errsKnown: withEps.reduce((n, s) => n + s.errs, 0), epsKnown: withEps.reduce((n, s) => n + s.eps.size, 0) };
+      }).filter((g) => g.n);
+      $("#qvmNote").textContent = f.month ? "" : " · Errors / QC'd ep uses shows with QC'd episodes set";
+      $("#qvmc").innerHTML = vmGroups.length ? `<div class="table-wrap"><table><thead><tr><th>Voice model</th><th class="num">Shows</th><th class="num">Errors</th><th class="num">Major</th><th class="num">Minor</th><th class="num">Pending</th><th class="num">Eps with errors</th><th class="num">QC'd eps</th><th class="num">Errors / QC'd ep</th><th class="num">Eps with errors %</th></tr></thead><tbody>
+        ${vmGroups.map((g) => `<tr><td>${g.vm ? `<a class="showlink" href="#errors" data-qvm="${esc(g.vm)}">${esc(g.vm)}</a>` : `<a class="showlink" href="#errors" data-qvm="none">No voice model</a>${staff ? " <small>(✎ on the show to set it)</small>" : ""}`}</td>
+          <td class="num">${g.n}</td><td class="num"><b>${g.errs}</b></td><td class="num">${g.major}</td><td class="num">${g.minor}</td><td class="num ${g.pending ? "late" : ""}">${g.pending}</td><td class="num">${g.eps}</td>
+          <td class="num">${g.qcEps || '<span class="dim">—</span>'}</td>
+          <td class="num">${!f.month && g.qcEps ? `<b>${ratio(g.errsKnown, g.qcEps)}</b>` : '<span class="dim">—</span>'}</td>
+          <td class="num">${!f.month && g.qcEps ? pct(g.epsKnown, g.qcEps) : '<span class="dim">—</span>'}</td></tr>`).join("")}
+        </tbody></table></div>` : `<div class="empty">No shows match these filters.</div>`;
+
       // By show (respects the month filter)
       const allTime = !f.month;
       $("#qshowsH").innerHTML = `By show <small class="dim">${f.month ? qcMonthLabel(f.month) : "All months"} · ${cur.shows.length} show(s)</small>`;
       $("#qshows").innerHTML = cur.shows.length ? `<div class="table-wrap"><table><thead><tr><th>Show</th><th class="num">Errors</th><th class="num">Major</th><th class="num">Minor</th>${cur.shows.some((s) => s.uncl) ? `<th class="num">Unclass.</th>` : ""}<th class="num">Pending</th><th class="num">Resolved</th><th class="num">Ignored</th><th class="num">Eps with errors</th><th class="num">QC'd eps</th><th class="num">Errors / QC'd ep</th><th class="num">Eps with errors %</th><th>Top issue</th></tr></thead><tbody>
         ${cur.shows.map((s) => { const o = (x) => esc(JSON.stringify({ month: f.month || "", show: s.id, ...x })); const showUncl = cur.shows.some((z) => z.uncl); return `<tr class="${f.show === s.id ? "qrow-on" : ""}">
-          <td><a class="showlink" data-qshow="${esc(s.id)}" href="#errors" title="Filter to this show">${esc(s.n.name)}</a><small>${s.n.de && s.n.de !== s.n.name ? esc(s.n.de) + " · " : ""}<code>${esc(s.id.slice(0, 12))}…</code>${s.n.show ? ` · <a href="#show/${s.n.show.id}">Show page</a>` : ""}</small></td>
+          <td><a class="showlink" data-qshow="${esc(s.id)}" href="#errors" title="Filter to this show">${esc(s.n.name)}</a><small>${QC.meta.get(s.id)?.voice_model ? `<b>${esc(QC.meta.get(s.id).voice_model)}</b> · ` : ""}${s.n.de && s.n.de !== s.n.name ? esc(s.n.de) + " · " : ""}<code>${esc(s.id.slice(0, 12))}…</code>${s.n.show ? ` · <a href="#show/${s.n.show.id}">Show page</a>` : ""}</small></td>
           <td class="num"><a class="qnum" data-qd="${o({})}"><b>${s.errs}</b></a></td>
           <td class="num">${s.major ? `<a class="qnum sev-major" data-qd="${o({ sev: "Major" })}">${s.major}</a>` : `<span class="dim">0</span>`}</td>
           <td class="num">${s.minor ? `<a class="qnum sev-minor" data-qd="${o({ sev: "Minor" })}">${s.minor}</a>` : `<span class="dim">0</span>`}</td>
@@ -1696,8 +1721,8 @@
 
     // 1. QC Dump (clean): one row per issue, cleaned. Severity, Stage and the unique-episode flags are formulas.
     const sorted = rows.slice().sort((a, b) => namer(a.de_show_id, a.show_title).name.localeCompare(namer(b.de_show_id, b.show_title).name) || (a.ep_no ?? 0) - (b.ep_no ?? 0) || a.id - b.id);
-    const DH = ["Show ID", "Show name", "DE title", "Chapter ID", "Episode title", "Ep No", "Time", "Status", "Remarks", "Category", "Issue type (QC tool)", "Issue type", "Severity", "Reviewer", "Audio status", "Stage", "Logged", "Month", "Unique ep (error)", "Unique ep (Major)", "Unique ep (Minor)"];
-    const dump = [DH.map((h, i) => H(h, i >= 11 && i !== 13 && i !== 14 ? 3 : 2))];
+    const DH = ["Show ID", "Show name", "DE title", "Chapter ID", "Episode title", "Ep No", "Time", "Status", "Remarks", "Category", "Issue type (QC tool)", "Issue type", "Severity", "Reviewer", "Audio status", "Stage", "Logged", "Month", "Unique ep (error)", "Unique ep (Major)", "Unique ep (Minor)", "Voice model", "Voice ID"];
+    const dump = [DH.map((h, i) => H(h, i >= 11 && i <= 20 && i !== 13 && i !== 14 ? 3 : 2))];
     const seenA = new Map(), seenS = new Map();
     sorted.forEach((r, i) => {
       const n = i + 2, d = det.get(r.id) || {}, sev = qcSev(r);
@@ -1715,6 +1740,7 @@
         F(`IF(M${n}="Not an error",0,IF(${first('"<>Not an error"')}=1,1,0))`, sev !== "Not an error" && seenAny === 1 ? 1 : 0, 0),
         F(`IF(M${n}<>"Major",0,IF(${first('"Major"')}=1,1,0))`, sev === "Major" && seenSev === 1 ? 1 : 0, 0),
         F(`IF(M${n}<>"Minor",0,IF(${first('"Minor"')}=1,1,0))`, sev === "Minor" && seenSev === 1 ? 1 : 0, 0),
+        V(QC.meta.get(r.de_show_id)?.voice_model || "", 0), V(QC.meta.get(r.de_show_id)?.voice_id || "", 0),
       ]);
     });
     const D = (c) => qref(WB.dump, c);
@@ -1727,14 +1753,21 @@
 
     // 3. Show IDs: name + total QC'd episodes (Ep Count)
     const ids = [...new Set([...shows.map((s) => s.id), ...QC.meta.keys()])];
-    const showRows = [[H("DE show ID"), H("Show name"), H("DE title"), H("QC'd episodes (Ep Count)")], ...ids.map((id) => { const n = namer(id); return [V(id, 0), V(n.name, 0), V(n.de, 0), V(QC.meta.get(id)?.ep_count ?? "", 0)]; })];
+    const showRows = [[H("DE show ID"), H("Show name"), H("DE title"), H("QC'd episodes (Ep Count)"), H("Start Ep"), H("End Ep"), H("Additional EPs"), H("QC'ed (Month)-Master Sheet"), H("Voice model"), H("Voice ID")],
+      ...ids.map((id) => { const n = namer(id), m = QC.meta.get(id) || {}; return [V(id, 0), V(n.name, 0), V(n.de, 0), V(m.ep_count ?? "", 0), V(m.start_ep ?? "", 0), V(m.end_ep ?? "", 0), V(m.additional_eps || "", 0), V(m.qc_month_master || "", 0), V(m.voice_model || "", 0), V(m.voice_id || "", 0)]; })];
 
     // 4. Summary: same layout as the old "Summary" tab, every number is a COUNTIFS on the clean dump
     const byLabel = (a, b) => a.localeCompare(b);
-    const used = (sev) => [...new Set(rows.filter((r) => qcSev(r) === sev).map((r) => qcLabel(r.issue_key, r.issue_type)))].sort(byLabel);
+    // Columns: the issue types with a Summary position (Issue types → sort_order, same as the 23 Oct workbook) always,
+    // in that order; any other type that has issues is added after them, A–Z.
+    const used = (sev) => {
+      const fixed = [...QC.types.values()].filter((t) => t.severity === sev && t.sort_order != null).sort((a, b) => a.sort_order - b.sort_order).map((t) => t.label);
+      const extra = [...new Set(rows.filter((r) => qcSev(r) === sev).map((r) => qcLabel(r.issue_key, r.issue_type)))].filter((l) => !fixed.includes(l)).sort(byLabel);
+      return [...new Set([...fixed, ...extra])];
+    };
     const major = used("Major"), minor = used("Minor"), uncl = used("Unclassified");
-    const head = [H("S. No."), H("SHOW NAMES"), H("Show IDs"), H("DE title"), H("QC'd months (dump)"), H("Ep Count"), H("First EP with error", 3), H("Last EP with error", 3), H("Additional EPs", 3),
-      H("Total Errors"), H("Total Errors Per Episode"), H("Major Errors"), ...major.map((t) => H(t, 3)), H("Minor Errors"), ...minor.map((t) => H(t, 3)),
+    const head = [H("S. No."), H("SHOW NAMES"), H("Show IDs"), H("QC'ed (Month)-Master Sheet"), H("QC'ed Dump"), H("Ep Count"), H("Start Ep"), H("End Ep"), H("Additional EPs"),
+      H("Total Errors"), H("Avg. Errors Per Episode"), H("Major Errors"), ...major.map((t) => H(t, 3)), H("Minor Errors"), ...minor.map((t) => H(t, 3)),
       ...(uncl.length ? [H("Unclassified"), ...uncl.map((t) => H(t, 3))] : []),
       H("Pending", 4), H("Resolved", 4), H("Ignore", 4),
       H("Unique Ep with error", 5), H("Unique Error Rate", 5), H("Unique Ep with Major error", 5), H("Unique Error Major Rate", 5), H("Unique Ep with Minor error", 5), H("Unique Error Minor Rate", 5)];
@@ -1747,15 +1780,14 @@
     const ERR = `${D("M")},"<>Not an error"`;
     const body = shows.map((s, i) => {
       const n = i + 3, C = `$C${n}`, mine = rows.filter((r) => r.de_show_id === s.id && qcSev(r) !== "Not an error");
-      const eps = mine.map((r) => r.ep_no).filter((x) => x != null);
       const cnt = (label, sev) => mine.filter((r) => qcLabel(r.issue_key, r.issue_type) === label && qcSev(r) === sev).length;
       const typeCell = (label, sev) => { const col = xcol(head.findIndex((h) => h.v === label && h.s === 3 && (sev === "Major" ? major : sev === "Minor" ? minor : uncl).includes(label))); return F(`COUNTIFS(${D("A")},${C},${D("L")},${col}$2,${D("M")},"${sev}")`, cnt(label, sev)); };
       const minorEps = new Set(mine.filter((r) => qcSev(r) === "Minor").map(epKey)).size;
       const rate = (col, v) => F(`IFERROR(${col}${n}/$F${n},"")`, s.qcEps ? v / s.qcEps : "", 9);
-      return [V(i + 1), V(s.n.name, 7), V(s.id), V(s.n.de), V([...new Set(mine.map((r) => r.month))].sort().map(mon).join(", ")),
+      const meta = QC.meta.get(s.id) || {};
+      return [V(i + 1), V(s.n.name, 7), V(s.id), V(meta.qc_month_master || ""), V([...new Set(mine.map((r) => r.month))].sort().map(mon).join(", ")),
         F(`IFERROR(VLOOKUP(${C},'${WB.shows}'!$A:$D,4,FALSE)+0,"")`, s.qcEps ?? ""),
-        F(`IFERROR(_xlfn.MINIFS(${D("F")},${D("A")},${C},${ERR}),"")`, eps.length ? Math.min(...eps) : ""),
-        F(`IFERROR(_xlfn.MAXIFS(${D("F")},${D("A")},${C},${ERR}),"")`, eps.length ? Math.max(...eps) : ""), V(""),
+        V(meta.start_ep ?? ""), V(meta.end_ep ?? ""), V(meta.additional_eps || ""),
         F(`${at("Major Errors")}${n}+${at("Minor Errors")}${n}${uncl.length ? `+${at("Unclassified")}${n}` : ""}`, s.errs),
         F(`IFERROR(${at("Total Errors")}${n}/$F${n},"")`, s.qcEps ? s.errs / s.qcEps : "", 8),
         F(`COUNTIFS(${D("A")},${C},${D("M")},"Major")`, s.major), ...major.map((t) => typeCell(t, "Major")),
@@ -1771,7 +1803,7 @@
       const c = xcol(ci), sum = (st = 10) => F(`SUM(${c}3:${c}${last})`, body.reduce((a, r) => a + (typeof r[ci].v === "number" ? r[ci].v : 0), 0), st);
       if (ci === 1) return { v: "Total", s: 10 };
       if (ci < 9 && ci !== 5) return { v: "", s: 10 };
-      if (h.v === "Total Errors Per Episode") return F(`IFERROR(SUMIFS(${at("Total Errors")}3:${at("Total Errors")}${last},$F3:$F${last},">0")/F${tr},"")`, "", 12);
+      if (h.v === "Avg. Errors Per Episode") return F(`IFERROR(SUMIFS(${at("Total Errors")}3:${at("Total Errors")}${last},$F3:$F${last},">0")/F${tr},"")`, "", 12);
       if (/Rate$/.test(h.v)) { const base = at(h.v.includes("Major") ? "Unique Ep with Major error" : h.v.includes("Minor") ? "Unique Ep with Minor error" : "Unique Ep with error"); return F(`IFERROR(SUMIFS(${base}3:${base}${last},$F3:$F${last},">0")/F${tr},"")`, "", 11); }
       return sum();
     });
@@ -1796,11 +1828,11 @@
     mrows.push([V("", 10), V("Pending", 10), ...months.map((m) => F(`COUNTIFS(${D("H")},"Pending",${ERR},${D("R")},${mc(m)}$1)`, rows.filter((r) => qcSev(r) !== "Not an error" && r.month === m && r.st === "pending").length, 10)), F(`SUM(C${pn}:${xcol(1 + months.length)}${pn})`, "", 10)]);
 
     return [
-      { name: WB.sum, rows: [top, head, ...body, total], merges: groups.map(([, c, span]) => `${xcol(c)}1:${xcol(c + span - 1)}1`), freeze: [2, 2], filter: `A2:${xcol(head.length - 1)}${last}`, widths: head.map((_, ci) => [6, 32, 44, 32, 14][ci] || 13), tallRow: 2 },
+      { name: WB.sum, rows: [top, head, ...body, total], merges: groups.map(([, c, span]) => `${xcol(c)}1:${xcol(c + span - 1)}1`), freeze: [2, 2], filter: `A2:${xcol(head.length - 1)}${last}`, widths: head.map((_, ci) => [6, 32, 44, 14, 12][ci] || 13), tallRow: 2 },
       { name: WB.mon, rows: mrows, freeze: [2, 1], widths: mh.map((_, ci) => (ci === 1 ? 34 : 12)), tallRow: 1 },
-      { name: WB.dump, rows: dump, freeze: [0, 1], filter: `A1:${xcol(DH.length - 1)}${dump.length}`, widths: [44, 30, 30, 44, 36, 7, 11, 10, 60, 9, 24, 24, 12, 30, 20, 9, 16, 9, 9, 9, 9], tallRow: 1 },
+      { name: WB.dump, rows: dump, freeze: [0, 1], filter: `A1:${xcol(DH.length - 1)}${dump.length}`, widths: [44, 30, 30, 44, 36, 7, 11, 10, 60, 9, 24, 24, 12, 30, 20, 9, 16, 9, 9, 9, 9, 13, 30], tallRow: 1 },
       { name: WB.quant, rows: quant, freeze: [0, 1], widths: [36, 14] },
-      { name: WB.shows, rows: showRows, freeze: [0, 1], widths: [44, 36, 36, 14] },
+      { name: WB.shows, rows: showRows, freeze: [0, 1], widths: [44, 36, 36, 14, 9, 9, 16, 14, 13, 30] },
     ];
   }
 
@@ -1878,13 +1910,13 @@
   }
 
   function qcShowRows(list, allTime) {
-    const head = ["Show", "DE title", "DE show ID", "Errors", "Major", "Minor", "Unclassified", "Pending", "Resolved", "Ignored", "Eps with errors", "Eps with Major errors", "QC'd eps", "Errors / QC'd ep", "Eps with errors %", "Top issue type", "Top issue count"];
-    return [head, ...list.map((s) => [s.n.name, s.n.de, s.id, s.errs, s.major, s.minor, s.uncl, s.pending, s.resolved, s.ignore, s.eps.size, s.epsMajor.size, s.qcEps ?? "",
+    const head = ["Show", "DE title", "DE show ID", "Voice model", "Errors", "Major", "Minor", "Unclassified", "Pending", "Resolved", "Ignored", "Eps with errors", "Eps with Major errors", "QC'd eps", "Errors / QC'd ep", "Eps with errors %", "Top issue type", "Top issue count"];
+    return [head, ...list.map((s) => [s.n.name, s.n.de, s.id, QC.meta.get(s.id)?.voice_model || "", s.errs, s.major, s.minor, s.uncl, s.pending, s.resolved, s.ignore, s.eps.size, s.epsMajor.size, s.qcEps ?? "",
       allTime && s.qcEps ? Number((s.errs / s.qcEps).toFixed(3)) : "", allTime && s.qcEps ? Number((s.eps.size / s.qcEps * 100).toFixed(1)) : "", s.top?.label || "", s.top?.n || ""])];
   }
   function qcIssueRows(list, det, namer) {
-    const head = ["Show", "DE show ID", "Episode", "Ep no", "Time", "Issue type", "Severity", "Category", "Stage", "Status", "Remarks", "Reviewer", "Logged", "Month"];
-    return [head, ...list.map((r) => { const d = det.get(r.id) || {}; return [namer(r.de_show_id, r.show_title).name, r.de_show_id, d.episode_title || "", r.ep_no ?? "", d.time_range || "", qcLabel(r.issue_key, r.issue_type), qcSev(r), r.category || "", r.stage, qcStatus(r.status), d.remarks || "", d.reviewer || "", r.logged_at ? fmtDT(r.logged_at) : "", qcMonthLabel(r.month)]; })];
+    const head = ["Show", "DE show ID", "Episode", "Ep no", "Time", "Issue type", "Severity", "Category", "Stage", "Status", "Remarks", "Reviewer", "Logged", "Month", "Voice model"];
+    return [head, ...list.map((r) => { const d = det.get(r.id) || {}; return [namer(r.de_show_id, r.show_title).name, r.de_show_id, d.episode_title || "", r.ep_no ?? "", d.time_range || "", qcLabel(r.issue_key, r.issue_type), qcSev(r), r.category || "", r.stage, qcStatus(r.status), d.remarks || "", d.reviewer || "", r.logged_at ? fmtDT(r.logged_at) : "", qcMonthLabel(r.month), r.vm]; })];
   }
 
   async function qcDrill(o, rows) {
@@ -1914,15 +1946,24 @@
     openModal(`QC details · ${n.name}`, `<form id="qsf"><div class="form">
         <div class="full"><label>DE show ID</label><code>${esc(id)}</code></div>
         <div class="full"><label for="qs_name">Name ${n.show ? "<small>(comes from Shows Master)</small>" : ""}</label><input id="qs_name" type="text" value="${esc(n.show ? n.show.name : m.name || "")}" ${n.show ? "disabled" : ""} placeholder="Show name"></div>
-        <div><label for="qs_eps">QC'd episodes <small>(total)</small></label><input id="qs_eps" type="text" inputmode="numeric" value="${m.ep_count ?? ""}" placeholder="e.g. 100"></div>
+        <div><label for="qs_eps">QC'd episodes <small>(Ep Count)</small></label><input id="qs_eps" type="text" inputmode="numeric" value="${m.ep_count ?? ""}" placeholder="e.g. 100"></div>
+        <div><label for="qs_month">QC'ed month <small>(master sheet)</small></label><input id="qs_month" type="text" value="${esc(m.qc_month_master || "")}" placeholder="e.g. Oct"></div>
+        <div><label for="qs_start">Start Ep</label><input id="qs_start" type="text" inputmode="numeric" value="${m.start_ep ?? ""}" placeholder="e.g. 1"></div>
+        <div><label for="qs_end">End Ep</label><input id="qs_end" type="text" inputmode="numeric" value="${m.end_ep ?? ""}" placeholder="e.g. 100"></div>
+        <div class="full"><label for="qs_add">Additional EPs</label><input id="qs_add" type="text" value="${esc(m.additional_eps || "")}" placeholder="e.g. RE - 3, 9-20"></div>
+        <div><label for="qs_vm">Voice model</label><select id="qs_vm"><option value="">—</option>${["V3 enhanced", "V4"].map((v) => `<option ${m.voice_model === v ? "selected" : ""}>${v}</option>`).join("")}</select></div>
+        <div><label for="qs_vid">Voice ID</label><input id="qs_vid" type="text" value="${esc(m.voice_id || "")}" placeholder="e.g. TGvCjJzuyubkDwINImMA"></div>
       </div>
-      <p class="hint">QC'd episodes is used for “Errors / QC'd ep”. Leave it empty if you don't know it.</p>
+      <p class="hint">QC'd episodes is used for “Errors / QC'd ep”. Start Ep / End Ep / Additional EPs and the month go into the Summary sheet of the QC workbook. Leave anything empty if you don't know it.</p>
       <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn primary">Save</button></div></form>`, (md) => {
       $("#qsf", md).onsubmit = async (e) => {
         e.preventDefault();
-        const raw = $("#qs_eps", md).value.trim();
-        if (raw && !/^\d+$/.test(raw)) return toast("QC'd episodes must be a whole number.", "bad");
-        const row = { de_show_id: id, ep_count: raw ? Number(raw) : null };
+        const num = (sel, label) => { const v = $(sel, md).value.trim(); if (v && !/^\d+$/.test(v)) { toast(`${label} must be a whole number.`, "bad"); return undefined; } return v ? Number(v) : null; };
+        const ep = num("#qs_eps", "QC'd episodes"), st = num("#qs_start", "Start Ep"), en = num("#qs_end", "End Ep");
+        if (ep === undefined || st === undefined || en === undefined) return;
+        if (st != null && en != null && en < st) return toast("End Ep can't be before Start Ep.", "bad");
+        const txt = (sel) => $(sel, md).value.trim() || null;
+        const row = { de_show_id: id, ep_count: ep, start_ep: st, end_ep: en, additional_eps: txt("#qs_add"), qc_month_master: txt("#qs_month"), voice_model: txt("#qs_vm"), voice_id: txt("#qs_vid") };
         if (!n.show) row.name = $("#qs_name", md).value.trim() || null;
         else if (m.name !== undefined) row.name = m.name;
         if (await qcWrite(sb.from("qc_shows").upsert(row), "Saved")) closeModal();
@@ -2073,25 +2114,58 @@
     const body = t.body.filter((r) => String(get(r, C.id)).trim() && String(get(r, C.type)).trim());
     const skipped = t.body.filter((r) => r.some((v) => String(v ?? "").trim())).length - body.length;
     const dates = resolveDates(body.map((r) => get(r, C.at)));
-    const seen = new Map();
-    body.forEach((r, i) => {
+    // Build the rows. Blank time / remark become "-" (cleaning step 4 / 8).
+    let filled = 0;
+    const all = body.map((r, i) => {
       const ept = fixText(get(r, C.ept));
       const epn = parseInt(get(r, C.epn), 10);
       const m = ept.match(/(?:episode|ep|folge)\s*(\d+)/i);
-      const row = {
+      let time = timeText(get(r, C.time)), rem = fixText(get(r, C.rem));
+      if (!time || !rem) filled++;
+      return {
         de_show_id: String(get(r, C.id)).trim(), show_title: fixText(get(r, C.title)) || null, chapter_id: String(get(r, C.ch)).trim() || null,
-        episode_title: ept || null, ep_no: Number.isFinite(epn) ? epn : m ? Number(m[1]) : null, time_range: timeText(get(r, C.time)) || null,
-        status: String(get(r, C.st)).trim().toLowerCase() || null, remarks: fixText(get(r, C.rem)) || null, category: String(get(r, C.cat)).trim() || null,
+        episode_title: ept || null, ep_no: Number.isFinite(epn) ? epn : m ? Number(m[1]) : null, time_range: time || "-",
+        status: String(get(r, C.st)).trim().toLowerCase() || null, remarks: rem || "-", category: String(get(r, C.cat)).trim() || null,
         issue_type: fixText(get(r, C.type)), reviewer: String(get(r, C.who)).trim() || null, audio_status: String(get(r, C.aud)).trim() || null, logged_at: dates.out[i],
       };
-      seen.set([row.de_show_id, row.chapter_id || "", row.time_range || "", qcKey(row.issue_type), row.remarks || ""].join("|"), row);
     });
+    // Step 1–3: exact duplicates (same everything except the tool's row number, create_time and version) → keep one.
+    const ws = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+    const exact = new Map();
+    for (const r of all) { const k = [r.de_show_id, r.chapter_id, r.episode_title, r.time_range, ws(r.remarks), r.status, r.category, r.issue_type, r.reviewer, r.audio_status].join("|"); const o = exact.get(k); if (!o || (r.logged_at || "") > (o.logged_at || "")) exact.set(k, r); }
+    const unique = [...exact.values()];
+    // Step 5–10: "Check" = rows with the same show + episode + time + remark.
+    //   Check ≥ 3 → keep one row: Resolved if there is one, else Ignore, else the latest Pending.
+    //   Check = 2 → delete Pending; delete Ignore if the other row is Resolved.
+    const RANK = { resolved: 3, ignore: 2, pending: 1 };
+    const rank = (r) => RANK[r.status] || 0;
+    const later = (a, b) => ((a.logged_at || "") >= (b.logged_at || "") ? a : b);
+    const groups = new Map();
+    for (const r of unique) { const k = [r.de_show_id, r.chapter_id || r.episode_title, r.time_range, ws(r.remarks)].join("|"); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(r); }
+    const kept = []; const check = { 2: 0, 3: 0 };
+    for (const g of groups.values()) {
+      if (g.length === 1) { kept.push(g[0]); continue; }
+      if (g.length >= 3) { check[3]++; const best = Math.max(...g.map(rank)); kept.push(g.filter((r) => rank(r) === best).reduce(later)); continue; }
+      check[2]++;                         // pair: drop Pending; if one is Resolved, drop Ignore too (keep both only when both are Resolved/both Ignore)
+      const best = Math.max(...g.map(rank));
+      const top = g.filter((r) => rank(r) === best);
+      kept.push(...(best === RANK.pending ? [top.reduce(later)] : top));
+    }
+    // Finally one row per issue as ShowOps stores it (show + episode + time + issue type + remark); prefer Resolved.
+    const seen = new Map();
+    for (const r of kept) {
+      const k = [r.de_show_id, r.chapter_id || "", r.time_range, qcKey(r.issue_type), ws(r.remarks)].join("|");
+      const o = seen.get(k);
+      if (!o || rank(r) > rank(o) || (rank(r) === rank(o) && r === later(r, o))) seen.set(k, r);
+    }
     const rows = [...seen.values()];
-    return { rows, skipped, dupes: body.length - rows.length, fixedDates: dates.fixed, noDate: rows.filter((r) => !r.logged_at).length };
+    return { rows, skipped, filled, exactDupes: all.length - unique.length, repeats: unique.length - rows.length, groups3: check[3], groups2: check[2],
+      fixedDates: dates.fixed, noDate: rows.filter((r) => !r.logged_at).length };
   }
 
   function qcUploadModal() {
     openModal("Upload QC dump", `<p class="hint" style="margin-top:0">Choose the QC tool's export as <b>CSV</b> or <b>Excel</b>. It needs the columns <code>show_id</code>, <code>issue_type</code> and <code>create_time</code>; the others (status, remarks, category, audio_status…) are picked up by name.</p>
+      <p class="hint">Upload the tool's file as it is: ShowOps does the cleaning (drops repeated logs keeping Resolved → Ignore → Pending, fills blank time/remark with “-”, adds Ep No).</p>
       <p class="hint">Safe to upload the same or an overlapping dump again: an issue already in ShowOps is updated (e.g. Pending → Resolved), not duplicated.</p>
       <input type="file" id="qfile" accept=".csv,.xlsx,.xlsm,.xls,text/csv">
       <div id="qprev" style="margin-top:14px"></div>`, (m) => {
@@ -2112,7 +2186,7 @@
             <div class="kv"><span>Shows</span><b>${shows}</b></div>
             <div class="kv"><span>Months</span><b>${Object.entries(months).sort().map(([k, n]) => `${qcMonthLabel(k)}: ${n}`).join(" · ")}</b></div>
             ${res.fixedDates ? `<div class="kv"><span>Dates fixed</span><b>${res.fixedDates} date(s) had day and month swapped by a sheet app; corrected.</b></div>` : ""}
-            ${res.dupes ? `<div class="kv"><span>Duplicates</span><b>${res.dupes} repeated row(s) in the file, kept once.</b></div>` : ""}
+            <div class="kv"><span>Cleaning</span><b>${res.exactDupes} exact duplicate(s) removed · ${res.repeats} repeated log(s) of the same issue removed (Resolved kept over Ignore over Pending${res.groups3 || res.groups2 ? `; ${res.groups3} group(s) of 3+, ${res.groups2} pair(s)` : ""}) · ${res.filled} blank time/remark filled with “-”</b></div>
             ${res.skipped ? `<div class="kv"><span>Skipped</span><b>${res.skipped} row(s) without a show ID or issue type.</b></div>` : ""}
             ${res.noDate ? `<div class="kv"><span>No date</span><b class="late">${res.noDate} row(s) have no readable create_time; they'll show under “No date”.</b></div>` : ""}
             ${newTypes.length ? `<div class="kv"><span>New issue types</span><b>${newTypes.length} not classified yet: ${esc(newTypes.slice(0, 6).join(", "))}${newTypes.length > 6 ? "…" : ""}. Classify them in “Issue types” after uploading.</b></div>` : ""}
@@ -2273,6 +2347,8 @@
         <div><label for="q_state">Show state on DE CMS</label><select id="q_state"><option value="">—</option>${MAQ_STATES.map((x) => `<option ${x === sh.maq_state ? "selected" : ""}>${x}</option>`).join("")}</select></div>
         <div><label for="q_nrc">NRC status</label><input id="q_nrc" type="text" value="${esc(sh.nrc_status || "")}" placeholder="e.g. Added"></div>
         <div><label for="q_nrcc">NRC cadence</label><input id="q_nrcc" type="text" value="${esc(sh.nrc_cadence || "")}" placeholder="e.g. 2 ep/day"></div>
+        <div><label for="q_srce">Source EPs <small>(scheduling)</small></label><input id="q_srce" type="text" value="${esc(sh.maq_src_eps ?? "")}" placeholder="e.g. 1206+"></div>
+        <div><label for="q_srcs">Source status <small>(scheduling)</small></label><select id="q_srcs"><option value="">—</option>${MAQ_STATES.map((x) => `<option ${x === sh.maq_src_status ? "selected" : ""}>${x}</option>`).join("")}</select></div>
         <div class="full"><label for="q_com">Comments</label><input id="q_com" type="text" value="${esc(sh.maq_comments || "")}" placeholder="e.g. 6:30 am schedule time"></div>
       </div>
       <p class="hint">Tip: with “2 eps/daily”, queuing 20 more episodes moves the date 10 days later.</p>
@@ -2281,7 +2357,7 @@
         e.preventDefault();
         const ep = $("#q_ep", m).value;
         const patch = { maq_till_ep: ep === "" ? null : Number(ep), maq_till_date: $("#q_date", m).value || null, maq_pattern: $("#q_pat", m).value.trim() || null,
-          maq_state: $("#q_state", m).value || null, nrc_status: $("#q_nrc", m).value.trim() || null, nrc_cadence: $("#q_nrcc", m).value.trim() || null, maq_comments: $("#q_com", m).value.trim() || null };
+          maq_state: $("#q_state", m).value || null, nrc_status: $("#q_nrc", m).value.trim() || null, nrc_cadence: $("#q_nrcc", m).value.trim() || null, maq_comments: $("#q_com", m).value.trim() || null, maq_src_eps: $("#q_srce", m).value.trim() || null, maq_src_status: $("#q_srcs", m).value || null };
         if (await save(sb.from("shows").update(patch).eq("id", sh.id), "MAQ updated")) closeModal();
       };
     });
